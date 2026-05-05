@@ -1,0 +1,199 @@
+package model
+
+import (
+	"context"
+	"log"
+	"math"
+	"marketmaker/config"
+	"marketmaker/exchange"
+	"marketmaker/paradigmpm"
+	"time"
+)
+
+// ParadigmBot runs the ported Paradigm PM strategy against one perpetual via exchange.I.
+type ParadigmBot struct {
+	Ex     exchange.I
+	Cfg    *config.ParadigmPMConfig
+	Strat  *paradigmpm.Strategy
+	Pair   string
+	Step   int
+	lastBuyFill  float64
+	lastSellFill float64
+}
+
+// NewParadigmBot creates a bot; cfg must be normalized (see ParadigmPMConfig.Normalize).
+func NewParadigmBot(ex exchange.I, cfg *config.ParadigmPMConfig) *ParadigmBot {
+	cfg.Normalize()
+	return &ParadigmBot{
+		Ex:    ex,
+		Cfg:   cfg,
+		Strat: paradigmpm.NewStrategy(),
+		Pair:  cfg.Pair,
+	}
+}
+
+// Run steps the strategy on a fixed interval until ctx is done.
+func (p *ParadigmBot) Run(ctx context.Context) {
+	if p.Pair == "" {
+		log.Println("ParadigmBot: no pair configured, exiting")
+		return
+	}
+	ticker := time.NewTicker(time.Duration(p.Cfg.StepIntervalMs) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.step()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *ParadigmBot) step() {
+	pd, err := p.Ex.Pair(p.Pair)
+	if err != nil {
+		log.Printf("paradigm: pair %s: %v", p.Pair, err)
+		return
+	}
+	mark := pd.MarkPrice
+	if mark <= 0 {
+		mark = pd.Price
+	}
+	if mark <= 0 {
+		log.Printf("paradigm: no mark for %s", p.Pair)
+		return
+	}
+
+	ob, err := p.Ex.GetOrderbook(p.Pair)
+	if err != nil {
+		log.Printf("paradigm: orderbook %s: %v", p.Pair, err)
+		return
+	}
+
+	bridge := paradigmpm.NewTickBridge(mark, p.Cfg.PriceBandPct)
+
+	var cb, ca *int
+	if len(ob.Bids) > 0 && len(ob.Asks) > 0 {
+		bTick := bridge.PriceToTick(ob.Bids[0].Price)
+		aTick := bridge.PriceToTick(ob.Asks[0].Price)
+		cb = &bTick
+		ca = &aTick
+	}
+
+	pos, perr := p.Ex.GetPosition(p.Pair)
+	var yesInv, noInv float64
+	if perr == nil {
+		usd := pos.Size * mark
+		sc := p.Cfg.InvUsdScale
+		if sc <= 0 {
+			sc = 10
+		}
+		if usd >= 0 {
+			yesInv = usd / sc
+		} else {
+			noInv = (-usd) / sc
+		}
+	}
+
+	freeCash := p.Cfg.StartingCash
+	if bg, ok := p.Ex.(interface{ GetAvailableBalance() float64 }); ok {
+		freeCash = bg.GetAvailableBalance()
+	}
+
+	state := paradigmpm.StepState{
+		Step:                   p.Step,
+		StepsRemaining:         max(0, p.Cfg.TotalSteps-p.Step),
+		Cash:                   p.Cfg.StartingCash,
+		YesInventory:           yesInv,
+		NoInventory:            noInv,
+		FreeCash:               freeCash,
+		CompetitorBestBidTicks: cb,
+		CompetitorBestAskTicks: ca,
+		BuyFilledQuantity:      p.lastBuyFill,
+		SellFilledQuantity:     p.lastSellFill,
+	}
+	p.lastBuyFill, p.lastSellFill = 0, 0
+
+	actions := p.Strat.OnStep(state)
+	p.Step++
+
+	if err := p.applyActions(pd, bridge, actions); err != nil {
+		log.Printf("paradigm: apply: %v", err)
+	}
+}
+
+func (p *ParadigmBot) applyActions(pd exchange.Pair, bridge paradigmpm.TickBridge, actions []paradigmpm.Action) error {
+	var place []exchange.Order
+	for _, a := range actions {
+		switch t := a.(type) {
+		case paradigmpm.CancelAll:
+			existing := p.Ex.GetOrders()
+			var cancel []exchange.Order
+			for _, o := range existing {
+				if o.Pair == p.Pair {
+					cancel = append(cancel, o)
+				}
+			}
+			if len(cancel) > 0 {
+				_ = p.Ex.CancelOrders(cancel)
+			}
+		case paradigmpm.PlaceOrder:
+			price := bridge.TickToPrice(t.Tick)
+			price = roundToTick(price, pd.Base.TickSize)
+			div := p.Cfg.QtyDivisor
+			if div <= 0 {
+				div = 50
+			}
+			size := t.Qty / div
+			if size < pd.Base.MinOrderSize {
+				continue
+			}
+			if size > pd.Base.MaxOrderSize && pd.Base.MaxOrderSize > 0 {
+				size = pd.Base.MaxOrderSize
+			}
+			side := "buy"
+			if t.Side == paradigmpm.SideSell {
+				side = "sell"
+			}
+			place = append(place, exchange.Order{
+				Pair:     p.Pair,
+				Price:    price,
+				Size:     size,
+				Side:     side,
+				Type:     "limit",
+				PostOnly: true,
+			})
+		default:
+		}
+	}
+	if len(place) > 0 {
+		return p.Ex.PlaceOrders(place)
+	}
+	return nil
+}
+
+func roundToTick(price, tick float64) float64 {
+	if tick <= 0 {
+		return price
+	}
+	return math.Round(price/tick) * tick
+}
+
+// Stop cancels all open orders on the configured pair.
+func (p *ParadigmBot) Stop() {
+	if p.Ex == nil || p.Pair == "" {
+		return
+	}
+	existing := p.Ex.GetOrders()
+	var cancel []exchange.Order
+	for _, o := range existing {
+		if o.Pair == p.Pair {
+			cancel = append(cancel, o)
+		}
+	}
+	if len(cancel) > 0 {
+		_ = p.Ex.CancelOrders(cancel)
+	}
+	log.Println("ParadigmBot stopped")
+}

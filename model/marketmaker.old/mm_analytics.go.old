@@ -1,0 +1,163 @@
+package model
+
+import (
+	"fmt"
+	"marketmaker/exchange"
+	"math"
+	"os"
+	"time"
+)
+
+// Analytics records a detected fill/close event inferred from position size changes
+// and estimates the resting time of the likely filled order on that side.
+type Analytics struct {
+	Timestamp         time.Time
+	Side              string  // "buy" for net increase, "sell" for net decrease
+	SizeChange        float64 // delta in position size (signed)
+	BeforeSize        float64 // previous position size
+	AfterSize         float64 // new position size
+	RestingDurationMs int64   // estimated time the order rested before fill
+	PostedAt          time.Time
+	PostedMidPrice    float64
+	EventMidPrice     float64
+	EdgeBps           float64 // side-adjusted edge estimate in basis points
+	FillPnl           float64
+}
+
+// collectFillEvents inspects current position size and, if changed
+// since the last check, records a fills with an estimated resting time for the
+// likely filled order. Resting time is estimated from the last known quote time for
+// that side when available, otherwise from the oldest open order timestamp.
+func (t *trader) collectFillEvents(pos *exchange.Position) {
+	currentSize := pos.Size
+
+	now := time.Now()
+
+	skew := t.parent.calculateInventorySkew()
+
+	t.Lock()
+	defer t.Unlock()
+
+	if !t._posInitialized {
+		t._lastPosSize = currentSize
+		t._posInitialized = true
+		return
+	}
+
+	if currentSize == t._lastPosSize {
+		return
+	}
+
+	delta := currentSize - t._lastPosSize
+	side := "buy"
+	if delta < 0 {
+		side = "sell"
+	}
+
+	// Prefer recorded last quote time for the side
+	var postedAt time.Time
+	switch side {
+	case "buy":
+		postedAt = t.LastQuoteTimeBuy
+	case "sell":
+		postedAt = t.LastQuoteTimeSell
+	}
+
+	// Fallback: find the oldest open order for this pair+side
+	if postedAt.IsZero() {
+		if orders, err := t.parent.Exchange.GetOrder(t.Pair); err == nil {
+			for _, o := range orders {
+				if o.Side == side && o.Status == "open" {
+					if postedAt.IsZero() || o.Time.Before(postedAt) {
+						postedAt = o.Time
+					}
+				}
+			}
+		}
+	}
+
+	var restingMs int64
+	if !postedAt.IsZero() {
+		restingMs = now.Sub(postedAt).Milliseconds()
+	}
+
+	// Use actual fill price from position for accurate PnL calculation
+	var fillPrice, eventMid float64
+	fillPrice = pos.AvgPrice // Use actual average fill price
+
+	// Get current mark price for comparison
+	if pd, err := t.parent.Exchange.Pair(t.Pair); err == nil {
+		eventMid = pd.MarkPrice
+		if eventMid == 0 {
+			eventMid = pd.Price
+		}
+	}
+
+	// Calculate edge: positive if we got a better price than current market
+	var edgeBps float64
+	if fillPrice > 0 && eventMid > 0 {
+		switch side {
+		case "buy":
+			// For buy: positive edge if we bought below current market
+			edgeBps = (eventMid - fillPrice) / fillPrice * 10000.0
+		case "sell":
+			// For sell: positive edge if we sold above current market
+			edgeBps = (fillPrice - eventMid) / fillPrice * 10000.0
+		}
+	}
+
+	// Calculate fill PnL using actual fill price
+	var fillPnL float64
+	if fillPrice > 0 {
+		// PnL = (current_price - fill_price) * size for buy
+		// PnL = (fill_price - current_price) * size for sell
+		switch side {
+		case "buy":
+			fillPnL = (eventMid - fillPrice) * math.Abs(delta)
+		case "sell":
+			fillPnL = (fillPrice - eventMid) * math.Abs(delta)
+		}
+	}
+
+	event := Analytics{
+		Timestamp:         now,
+		Side:              side,
+		SizeChange:        delta,
+		BeforeSize:        t._lastPosSize,
+		AfterSize:         currentSize,
+		RestingDurationMs: restingMs,
+		PostedAt:          postedAt,
+		PostedMidPrice:    fillPrice,
+		EventMidPrice:     eventMid,
+		EdgeBps:           edgeBps,
+		FillPnl:           fillPnL,
+	}
+	insertWithLimitInPlace(&t.FillEvents, event, ARRAY_LENGTH)
+
+	// Update last observed size
+	t._lastPosSize = currentSize
+
+	// Append event to reports/pair_data.txt for later inspection
+	// Ensure reports directory exists
+	_ = os.MkdirAll("reports", 0o755)
+	f, err := os.OpenFile("reports/"+t.Pair+".txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err == nil {
+		// Header describing columns (printed once per file creation)
+		fi, statErr := f.Stat()
+		if statErr == nil && fi.Size() == 0 {
+			header := fmt.Sprintf("%-25s %-10s %-6s %8s %12s %12s %8s %12s %10s\n",
+				"timestamp", "pair", "side", "rest_ms", "posted_mid", "event_mid", "skew", "edge_bps", "fill_pnl")
+			_, _ = f.WriteString(header)
+			// Add separator line
+			separator := fmt.Sprintf("%-25s %-10s %-6s %8s %12s %12s %8s %12s %10s\n",
+				"-------------------------", "----------", "------", "--------", "------------", "------------", "--------", "------------", "----------")
+			_, _ = f.WriteString(separator)
+		}
+
+		// Single-line record with fixed spacing, no extra blank lines
+		line := fmt.Sprintf("%-25s %-10s %-6s %8d %12.6f %12.6f %8.2f %12.6f %10.2f\n",
+			now.Format(time.RFC3339), t.Pair, side, restingMs, fillPrice, eventMid, skew, edgeBps, fillPnL)
+		_, _ = f.WriteString(line)
+		_ = f.Close()
+	}
+}

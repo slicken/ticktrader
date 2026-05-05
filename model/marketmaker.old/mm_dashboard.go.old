@@ -1,0 +1,958 @@
+package model
+
+import (
+	"context"
+	"encoding/json"
+	"html/template"
+	"log"
+	"marketmaker/exchange"
+	"net/http"
+	"sync"
+	"time"
+
+	"math"
+
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for development
+	},
+}
+
+// DashboardData represents the data structure for the dashboard
+type DashboardData struct {
+	PairsData        []PairData `json:"pairs_data"`
+	LastUpdate       time.Time  `json:"last_update"`
+	TotalPnL         float64    `json:"total_pnl"`
+	TotalSize        float64    `json:"total_size"`
+	TotalValue       float64    `json:"total_value"`
+	ActivePairs      int        `json:"active_pairs"`
+	LatencyMs        int        `json:"latency_ms"`
+	MaxLatencyMs     int        `json:"max_latency_ms"`
+	InventorySkew    float64    `json:"inventory_skew"`
+	PositionBuySize  float64    `json:"position_buy_size"`
+	PositionSellSize float64    `json:"position_sell_size"`
+}
+
+// PairData represents individual pair data for the dashboard
+type PairData struct {
+	Pair        string  `json:"pair"`
+	IndexPrice  float64 `json:"price"`
+	MarkPrice   float64 `json:"mark_price"`
+	FundingRate float64 `json:"funding_rate"`
+	PremiumPct  float64 `json:"premium_pct"`
+	SpreadAvg   float64 `json:"spread_avg"` // Spread average
+	Spread      float64 `json:"spread"`     // Raw orderbook spread (Ask - Bid)
+	ImpactAvg   float64 `json:"trades_avg"` // Average impact percentage
+
+	TradeScore      float64 `json:"trade_score"`       // Trade score: positive = good to trade LONG, negative = good to trade SHORT
+	HoldScore       float64 `json:"hold_score"`        // Hold score: positive = profitable to hold LONG, negative = profitable to hold SHORT
+	TradeCounter    int     `json:"trade_counter"`     // Number of trades processed
+	Inventory       float64 `json:"inventory"`         // Actual filled inventory
+	PendingBuySize  float64 `json:"pending_buy_size"`  // Pending buy orders (LIMIT/TRIGGER)
+	PendingSellSize float64 `json:"pending_sell_size"` // Pending sell orders (LIMIT/TRIGGER)
+	TotalSize       float64 `json:"total_size"`        // Inventory + Pending
+	AvgPrice        float64 `json:"avg_price"`         // Average entry price for position
+	PnL             float64 `json:"pnl"`
+	PnLPct          float64 `json:"pnl_pct"`       // PnL percentage
+	IsPerp          bool    `json:"is_perp"`       // True for perpetual futures, false for spot
+	Volume          float64 `json:"volume"`        // Total volume (asks + bids)
+	ImbalancePct    float64 `json:"imbalance_pct"` // Imbalance percentage (positive = more bids, negative = more asks)
+	Volatility      float64 `json:"volatility"`    // Volatility percentage
+	Allowed         bool    `json:"allowed"`       // Whether trader is allowed
+}
+
+// Dashboard manages the HTTP dashboard and WebSocket connections
+type Dashboard struct {
+	mm           *MarketMaker
+	clients      map[*websocket.Conn]*sync.Mutex // Each client has its own write mutex
+	clientsMutex sync.RWMutex
+	port         string
+	server       *http.Server
+}
+
+// NewDashboard creates a new dashboard instance
+func NewDashboard(mm *MarketMaker, port string) *Dashboard {
+	return &Dashboard{
+		mm:      mm,
+		clients: make(map[*websocket.Conn]*sync.Mutex),
+		port:    port,
+	}
+}
+
+// Start initializes and starts the dashboard server
+func (d *Dashboard) Start(ctx context.Context) {
+	// Set up HTTP routes
+	http.HandleFunc("/", d.dashboardHandler)
+	http.HandleFunc("/api/data", d.apiHandler)
+	http.HandleFunc("/ws", d.wsHandler)
+
+	// Create server with context
+	d.server = &http.Server{
+		Addr:    d.port,
+		Handler: nil, // Use default mux
+	}
+
+	// Start the server
+	go func() {
+		if err := d.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			// Dashboard error handled silently
+		}
+	}()
+
+	// Start data broadcasting
+	go d.broadcastData(ctx)
+
+	// Wait for context cancellation
+	<-ctx.Done()
+	// Graceful shutdown
+	// Dashboard shutdown handled silently
+
+	// Close all WebSocket connections
+	d.clientsMutex.Lock()
+	for client := range d.clients {
+		client.Close()
+	}
+	d.clients = make(map[*websocket.Conn]*sync.Mutex)
+	d.clientsMutex.Unlock()
+
+	// Shutdown HTTP server
+	if d.server != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.server.Shutdown(shutdownCtx); err != nil {
+			// Dashboard shutdown error handled silently
+		}
+	}
+	log.Printf("Dashboard stopped!")
+}
+
+// dashboardHandler serves the main dashboard HTML page
+func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
+	tmpl := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Market Maker Dashboard</title>
+    <meta charset="utf-8">
+    <style>
+        body { 
+            font-family: 'Courier New', 'Monaco', 'Menlo', 'Consolas', monospace; 
+            margin: 0; 
+            padding: 20px; 
+            background-color: #1a1a1a; 
+            color: #ffffff; 
+        }
+        .stats { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+            gap: 15px; 
+            margin-bottom: 20px; 
+        }
+        .stat-card { 
+            background: #2a2a2a; 
+            padding: 15px; 
+            border-radius: 8px; 
+            text-align: center; 
+        }
+        .stat-value { 
+            font-size: 24px; 
+            font-weight: bold; 
+            color: #ffffff; 
+        }
+        .stat-label { 
+            font-size: 12px; 
+            color: #888; 
+            text-transform: uppercase; 
+        }
+        .table-container { 
+            background: #2a2a2a; 
+            border-radius: 8px; 
+            overflow: hidden; 
+            margin-bottom: 20px; 
+            overflow-x: auto; /* allow horizontal scroll on very small screens */
+        }
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            font-size: 9px; 
+            table-layout: fixed;
+        }
+        th { 
+            background: #333; 
+            padding: 8px 6px; 
+            text-align: left; 
+            font-weight: 600; 
+            color: #ffffff; 
+            font-size: 9px;
+            position: relative;
+        }
+        
+        th.sort-asc::after {
+            content: ' ▲';
+            font-weight: bold;
+        }
+        
+        th.sort-desc::after {
+            content: ' ▼';
+            font-weight: bold;
+        }
+        td { 
+            padding: 6px 8px; 
+            border-bottom: 1px solid #444; 
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            font-size: 9px;
+            line-height: 1.2;
+            white-space: nowrap; 
+            overflow: hidden; 
+            text-overflow: ellipsis;
+        }
+
+        /* Column widths for better layout */
+        /* Positions table (6 columns) */
+        #positions-table th:nth-child(1), #positions-table td:nth-child(1) { width: 16%; }  /* Pair */
+        #positions-table th:nth-child(2), #positions-table td:nth-child(2) { width: 16%; }  /* Avg Price */
+        #positions-table th:nth-child(3), #positions-table td:nth-child(3) { width: 16%; }  /* Direction */
+        #positions-table th:nth-child(4), #positions-table td:nth-child(4) { width: 16%; }  /* Inventory (USD) */
+        #positions-table th:nth-child(5), #positions-table td:nth-child(5) { width: 16%; }  /* Pending (USD) */
+        #positions-table th:nth-child(6), #positions-table td:nth-child(6) { width: 20%; }  /* P&L */
+
+		/* Opportunities tables (16 columns) - exact widths to sum ~100% */
+		#long-table th:nth-child(1),  #long-table td:nth-child(1),
+		#short-table th:nth-child(1), #short-table td:nth-child(1)  { width: 7%; }   /* Pair */
+		#long-table th:nth-child(2),  #long-table td:nth-child(2),
+		#short-table th:nth-child(2), #short-table td:nth-child(2)  { width: 7%; }   /* Price */
+		#long-table th:nth-child(3),  #long-table td:nth-child(3),
+		#short-table th:nth-child(3), #short-table td:nth-child(3)  { width: 6%; }   /* Market Spread% */
+		#long-table th:nth-child(4),  #long-table td:nth-child(4),
+		#short-table th:nth-child(4), #short-table td:nth-child(4)  { width: 6%; }   /* Calc Spread% */
+		#long-table th:nth-child(5),  #long-table td:nth-child(5),
+		#short-table th:nth-child(5), #short-table td:nth-child(5)  { width: 5%; }   /* Impact% */
+		#long-table th:nth-child(6),  #long-table td:nth-child(6),
+		#short-table th:nth-child(6), #short-table td:nth-child(6)  { width: 7%; }   /* OB Vol(10) */
+		#long-table th:nth-child(7),  #long-table td:nth-child(7),
+		#short-table th:nth-child(7), #short-table td:nth-child(7)  { width: 5%; }   /* OB Imb% */
+		#long-table th:nth-child(8),  #long-table td:nth-child(8),
+		#short-table th:nth-child(8), #short-table td:nth-child(8)  { width: 6%; }   /* Volatility% */
+		#long-table th:nth-child(9),  #long-table td:nth-child(9),
+		#short-table th:nth-child(9), #short-table td:nth-child(9)  { width: 5%; }   /* Premium% */
+		#long-table th:nth-child(10), #long-table td:nth-child(10),
+		#short-table th:nth-child(10),#short-table td:nth-child(10) { width: 5%; }   /* Funding% */
+		#long-table th:nth-child(11), #long-table td:nth-child(11),
+		#short-table th:nth-child(11),#short-table td:nth-child(11) { width: 6%; }   /* Trade Score */
+		#long-table th:nth-child(12), #long-table td:nth-child(12),
+		#short-table th:nth-child(12),#short-table td:nth-child(12) { width: 6%; }   /* Hold Score */
+		#long-table th:nth-child(13), #long-table td:nth-child(13),
+		#short-table th:nth-child(13),#short-table td:nth-child(13) { width: 6%; }   /* Trades/min */
+		#long-table th:nth-child(14), #long-table td:nth-child(14),
+		#short-table th:nth-child(14),#short-table td:nth-child(14) { width: 16%; }  /* Pending */
+        tr:hover { 
+            background: #3a3a3a; 
+        }
+        .bullish { color: #4ade80; font-weight: bold; }
+        .bearish { color: #f87171; font-weight: bold; }
+        .neutral { color: #9ca3af; }
+        .positive { color: #4ade80; }
+        .negative { color: #f87171; }
+        .status { 
+            position: fixed; 
+            top: 20px; 
+            right: 20px; 
+            padding: 10px 15px; 
+            border-radius: 20px; 
+            font-size: 12px; 
+            font-weight: bold; 
+            text-align: center;
+        }
+        .status-latency {
+            font-size: 10px;
+            font-weight: normal;
+            margin-top: 5px;
+            opacity: 0.8;
+        }
+        .connected { background: #4ade80; color: #000; }
+        .disconnected { background: #f87171; color: #fff; }
+
+        .tables-container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .table-section {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 15px;
+            flex: 1;
+        }
+        .table-section h2 {
+            margin: 0 0 15px 0;
+            color: #ffffff;
+            font-size: 18px;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="stats" id="stats">
+        <div class="stat-card">
+            <div class="stat-value" id="total-pnl">$0.00</div>
+            <div class="stat-label">TOTAL P&L</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="net-position">$0.00</div>
+            <div class="stat-label">NET POSITION</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="total-value">$0.00</div>
+            <div class="stat-summary" id="position-summary" style="font-size: 12px; margin: 4px 0; line-height: 1.2;"></div>
+            <div class="stat-label">POSITION VALUE</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="pending-value">$0.00</div>
+            <div class="stat-summary" id="pending-summary" style="font-size: 12px; margin: 4px 0; line-height: 1.2;"></div>
+            <div class="stat-label">PENDING VALUE</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="inventory-skew">0.00</div>
+            <div class="stat-label">INVENTORY SKEW</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="active-pairs">0</div>
+            <div class="stat-label">ACTIVE PAIRS</div>
+        </div>
+    </div>
+
+    <div class="status" id="status" style="position: fixed; top: 20px; right: 20px; z-index: 1000;">
+        <div id="connection-status">Disconnected</div>
+        <div class="status-latency" id="status-latency">0ms (max: 0ms)</div>
+    </div>
+
+    <div id="positions-section" class="table-section" style="display: none; margin-bottom: 20px;">
+        <h2>ACTIVE POSITIONS</h2>
+        <div class="table-container">
+            <table id="positions-table">
+                <thead>
+                    <tr>
+                        <th>Pair</th>
+                        <th>Avg Price</th>
+                        <th>Direction</th>
+                        <th>Inventory</th>
+                        <th>Pending</th>
+                        <th>P&L</th>
+                    </tr>
+                </thead>
+                <tbody id="positions-tbody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="tables-container">
+            <div class="table-section">
+                <h2>LONG Opportunities</h2>
+                <div class="table-container">
+                    <table id="long-table">
+                        <thead>
+                            <tr>
+                                <th>Pair</th>
+                                <th>Price</th>
+                                <th>Market<br>Spread%</th>
+                                <th>Calc<br>Spread%</th>
+                                <th>Impact%</th>
+                                <th>OB Vol(10)</th>
+                                <th>OB Imb%</th>
+                                <th>Volatility%</th>
+                                <th>Premium%</th>
+                                <th>Funding%</th>
+                                <th>Trade<br>Score</th>
+                                <th>Hold<br>Score</th>
+                                <th>Trades/min</th>
+                                <th>Pending</th>
+                            </tr>
+                        </thead>
+                        <tbody id="long-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="table-section">
+                <h2>SHORT Opportunities</h2>
+                <div class="table-container">
+                    <table id="short-table">
+                        <thead>
+                            <tr>
+                                <th>Pair</th>
+                                <th>Price</th>
+                                <th>Market<br>Spread%</th>
+                                <th>Calc<br>Spread%</th>
+                                <th>Impact%</th>
+                                <th>OB Vol(10)</th>
+                                <th>OB Imb%</th>
+                                <th>Volatility%</th>
+                                <th>Premium%</th>
+                                <th>Funding%</th>
+                                <th>Trade<br>Score</th>
+                                <th>Hold<br>Score</th>
+                                <th>Trades/min</th>
+                                <th>Pending</th>
+                            </tr>
+                        </thead>
+                        <tbody id="short-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        // No previous-value tracking
+
+        function connect() {
+            ws = new WebSocket('ws://' + window.location.host + '/ws');
+            
+            ws.onopen = function() {
+                document.getElementById('connection-status').textContent = 'Connected';
+                document.getElementById('status').className = 'status connected';
+                reconnectAttempts = 0;
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                updateDashboard(data);
+            };
+            
+            ws.onclose = function() {
+                document.getElementById('connection-status').textContent = 'Disconnected';
+                document.getElementById('status').className = 'status disconnected';
+                
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    setTimeout(connect, 1000 * reconnectAttempts);
+                }
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        function updateDashboard(data) {
+            // Store current data for sorting
+            window.currentData = data;
+            
+            // Calculate pending value from pairs data
+            let pendingValue = 0;
+            let totalPendingBuy = 0;
+            let totalPendingSell = 0;
+            data.pairs_data.forEach(pair => {
+                totalPendingBuy += pair.pending_buy_size;
+                totalPendingSell += pair.pending_sell_size;
+                pendingValue += pair.pending_buy_size + pair.pending_sell_size; // All sizes are positive USD values
+            });
+            
+            // Update stats (current only)
+            document.getElementById('total-pnl').textContent = '$' + data.total_pnl.toFixed(2);
+            document.getElementById('net-position').textContent = '$' + data.total_size.toFixed(2);
+            document.getElementById('total-value').textContent = '$' + data.total_value.toFixed(2);
+            document.getElementById('pending-value').textContent = '$' + pendingValue.toFixed(2);
+            
+            // Update pending summary with buy/sell breakdown
+            let pendingSummaryHtml = '';
+            if (totalPendingBuy > 0 || totalPendingSell > 0) {
+                pendingSummaryHtml = '<span style="color: #4CAF50;">$' + totalPendingBuy.toFixed(2) + '</span> / <span style="color: #f44336;">$' + totalPendingSell.toFixed(2) + '</span>';
+            }
+            document.getElementById('pending-summary').innerHTML = pendingSummaryHtml;
+            
+            // Update position summary with buy/sell breakdown
+            let positionSummaryHtml = '';
+            if (data.position_buy_size > 0 || data.position_sell_size > 0) {
+                positionSummaryHtml = '<span style="color: #4CAF50;">$' + data.position_buy_size.toFixed(2) + '</span> / <span style="color: #f44336;">$' + data.position_sell_size.toFixed(2) + '</span>';
+            }
+            document.getElementById('position-summary').innerHTML = positionSummaryHtml;
+            
+            document.getElementById('inventory-skew').textContent = data.inventory_skew.toFixed(2);
+            document.getElementById('active-pairs').textContent = data.active_pairs;
+            // No previous total tracking
+            
+            // Update status latency
+            document.getElementById('status-latency').textContent = data.latency_ms + 'ms / ' + data.max_latency_ms + 'ms';
+
+            // Update positions table
+            updatePositionsTable(data.pairs_data);
+
+            // Update tables
+            updateTable('long-tbody', data.pairs_data, longTableSort.field, longTableSort.desc);
+            updateTable('short-tbody', data.pairs_data, shortTableSort.field, shortTableSort.desc);
+        }
+
+        // Global variables to track sort state for each table
+        // Both windows default to sorting by TradeScore (descending)
+        let longTableSort = { field: 'trade_score', desc: true };
+        let shortTableSort = { field: 'trade_score', desc: true };
+
+        function updateTable(tbodyId, pairsData, sortField, sortDesc) {
+            const tbody = document.getElementById(tbodyId);
+            tbody.innerHTML = '';
+
+            // Filter data based on table type
+            // LONG window = HoldScore >= 0
+            // SHORT window = HoldScore < 0
+            let filteredData = pairsData;
+            if (tbodyId === 'long-tbody') {
+                filteredData = pairsData.filter(pair => pair.hold_score >= 0);
+            } else if (tbodyId === 'short-tbody') {
+                filteredData = pairsData.filter(pair => pair.hold_score < 0);
+            }
+
+            // Sort data by current sort state
+            if (sortField) {
+                filteredData.sort((a, b) => {
+                    let comparison;
+                    if (sortDesc) {
+                        comparison = b[sortField] - a[sortField];
+                    } else {
+                        comparison = a[sortField] - b[sortField];
+                    }
+                    
+                    // If primary sort is equal, use funding rate as secondary sort
+                    if (comparison === 0) {
+                        return b.funding_rate - a.funding_rate; // Higher funding rate first
+                    }
+                    
+                    return comparison;
+                });
+            }
+
+            filteredData.forEach(pair => {
+                const row = tbody.insertRow();
+                const pairClass = pair.allowed ? '' : 'bearish';
+                
+                // Create pending orders display with buy (green) and sell (red) on separate lines
+                let pendingDisplay = '';
+                if (pair.pending_buy_size > 0) {
+                    pendingDisplay += '<div class="positive">$' + pair.pending_buy_size.toFixed(2) + '</div>';
+                }
+                if (pair.pending_sell_size > 0) {
+                    pendingDisplay += '<div class="negative">$' + pair.pending_sell_size.toFixed(2) + '</div>';
+                }
+                if (pendingDisplay === '') {
+                    pendingDisplay = '<div class="neutral">$0.00</div>';
+                }
+                
+                row.innerHTML = 
+                    '<td class="' + pairClass + '">' + pair.pair + '</td>' +
+                    '<td>$' + pair.price.toFixed(4) + '</td>' +
+                    '<td class="neutral">' + pair.spread_avg.toFixed(4) + '</td>' +
+                    '<td class="neutral">' + (pair.spread || 0).toFixed(4) + '</td>' +
+                    '<td class="neutral">' + pair.trades_avg.toFixed(4) + '</td>' +
+                    '<td class="neutral">' + (pair.volume || 0).toFixed(2) + '</td>' +
+                    '<td class="neutral">' + (pair.imbalance_pct || 0).toFixed(4) + '</td>' +
+                    '<td class="neutral">' + (pair.volatility || 0).toFixed(4) + '</td>' +
+                    '<td class="' + getValueClass(pair.premium_pct) + '">' + pair.premium_pct.toFixed(4) + '</td>' +
+                    '<td class="' + getValueClass(pair.funding_rate) + '">' + pair.funding_rate.toFixed(4) + '</td>' +
+                    '<td>' + pair.trade_score.toFixed(2) + '</td>' +
+                    '<td>' + pair.hold_score.toFixed(2) + '</td>' +
+                    '<td>' + pair.trade_counter + '</td>' +
+                    '<td>' + pendingDisplay + '</td>';
+            });
+        }
+
+        function updatePositionsTable(pairsData) {
+            const positionsSection = document.getElementById('positions-section');
+            const tbody = document.getElementById('positions-tbody');
+            tbody.innerHTML = '';
+
+            // Filter pairs with non-zero inventory ONLY (not just pending orders)
+            const positionsData = pairsData.filter(pair => pair.inventory !== 0);
+
+            if (positionsData.length === 0) {
+                positionsSection.style.display = 'none';
+                return;
+            }
+
+            // Show positions section
+            positionsSection.style.display = 'block';
+
+            // Sort positions by PNL (descending - highest PNL first)
+            positionsData.sort((a, b) => b.pnl - a.pnl);
+
+            positionsData.forEach(pair => {
+                const row = tbody.insertRow();
+                
+                // Determine direction based solely on position inventory size
+                const direction = pair.inventory > 0 ? 'LONG' : pair.inventory < 0 ? 'SHORT' : 'NEUTRAL';
+                const directionClass = pair.inventory > 0 ? 'bullish' : pair.inventory < 0 ? 'bearish' : 'neutral';
+                
+                // Calculate inventory value in USD
+                const inventoryValue = pair.inventory * pair.price;
+                
+                // Create pending orders display with buy (green) and sell (red) on separate lines
+                let pendingDisplay = '';
+                if (pair.pending_buy_size > 0) {
+                    pendingDisplay += '<div class="positive">$' + pair.pending_buy_size.toFixed(2) + '</div>';
+                }
+                if (pair.pending_sell_size > 0) {
+                    pendingDisplay += '<div class="negative">$' + pair.pending_sell_size.toFixed(2) + '</div>';
+                }
+                if (pendingDisplay === '') {
+                    pendingDisplay = '<div class="neutral">$0.00</div>';
+                }
+                
+                const pairClass = pair.allowed ? '' : 'bearish';
+                // current PnL only
+                
+                row.innerHTML = 
+                    '<td class="' + pairClass + '">' + pair.pair + '</td>' +
+                    '<td>$' + pair.avg_price.toFixed(4) + '</td>' +
+                    '<td class="' + directionClass + '">' + direction + '</td>' +
+                    '<td class="' + getValueClass(inventoryValue) + '">$' + inventoryValue.toFixed(2) + '</td>' +
+                    '<td>' + pendingDisplay + '</td>' +
+                    '<td class="' + getValueClass(pair.pnl) + '">$' + pair.pnl.toFixed(2) + ' (' + pair.pnl_pct.toFixed(2) + '%)</td>';
+            });
+        }
+
+        function getValueClass(value) {
+            if (value === 0) return 'neutral';
+            return value > 0 ? 'positive' : 'negative';
+        }
+
+        function getScoreClass(score, threshold) {
+            if (Math.abs(score) >= threshold) {
+                return 'positive'; // Green for scores above threshold
+            }
+            return ''; // No class = same color as Price and Pair (default/white)
+        }
+
+        // Column sorting functions
+        function sortTable(tableId, columnIndex, fieldName) {
+            const table = document.getElementById(tableId);
+            const tbody = table.querySelector('tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            
+            // Determine which sort state to use
+            let sortState;
+            if (tableId === 'long-table') {
+                sortState = longTableSort;
+            } else if (tableId === 'short-table') {
+                sortState = shortTableSort;
+            }
+            
+            // Toggle sort direction if same column, otherwise set to ascending
+            if (sortState.field === fieldName) {
+                sortState.desc = !sortState.desc;
+            } else {
+                sortState.field = fieldName;
+                sortState.desc = false; // Default to ascending
+            }
+            
+            // Update the table with new sort
+            if (window.currentData) {
+                if (tableId === 'long-table') {
+                    updateTable('long-tbody', window.currentData.pairs_data, sortState.field, sortState.desc);
+                } else if (tableId === 'short-table') {
+                    updateTable('short-tbody', window.currentData.pairs_data, sortState.field, sortState.desc);
+                }
+            }
+            
+            // Update header styling to show sort direction
+            updateHeaderSortIndicator(tableId, columnIndex, sortState.desc);
+        }
+        
+        function updateHeaderSortIndicator(tableId, activeColumnIndex, isDesc) {
+            const table = document.getElementById(tableId);
+            const headers = table.querySelectorAll('th');
+            
+            // Remove all sort indicators
+            headers.forEach(header => {
+                header.classList.remove('sort-asc', 'sort-desc');
+            });
+            
+            // Add sort indicator to active column
+            if (activeColumnIndex >= 0 && activeColumnIndex < headers.length) {
+                headers[activeColumnIndex].classList.add(isDesc ? 'sort-desc' : 'sort-asc');
+            }
+        }
+        
+        function setupTableSorting() {
+            // Setup click handlers for LONG table
+            const longTable = document.getElementById('long-table');
+            const longHeaders = longTable.querySelectorAll('th');
+            longHeaders.forEach((header, index) => {
+                header.style.cursor = 'pointer';
+                header.addEventListener('click', () => {
+                    const fieldMap = [
+                        'pair', 'price', 'spread_avg', 'spread',
+                        'trades_avg', 'volume', 'imbalance_pct', 'volatility',
+                        'premium_pct', 'funding_rate', 'trade_score', 'hold_score',
+                        'trade_counter', 'pending_buy_size'
+                    ];
+                    if (fieldMap[index]) {
+                        sortTable('long-table', index, fieldMap[index]);
+                    }
+                });
+            });
+            
+            // Setup click handlers for SHORT table
+            const shortTable = document.getElementById('short-table');
+            const shortHeaders = shortTable.querySelectorAll('th');
+            shortHeaders.forEach((header, index) => {
+                header.style.cursor = 'pointer';
+                header.addEventListener('click', () => {
+                    const fieldMap = [
+                        'pair', 'price', 'spread_avg', 'spread',
+                        'trades_avg', 'volume', 'imbalance_pct', 'volatility',
+                        'premium_pct', 'funding_rate', 'trade_score', 'hold_score',
+                        'trade_counter', 'pending_sell_size'
+                    ];
+                    if (fieldMap[index]) {
+                        sortTable('short-table', index, fieldMap[index]);
+                    }
+                });
+            });
+        }
+
+        // Connect on page load
+        connect();
+        
+        // Setup table sorting after page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            setupTableSorting();
+        });
+    </script>
+</body>
+</html>`
+
+	template.Must(template.New("dashboard").Parse(tmpl)).Execute(w, nil)
+}
+
+// apiHandler serves JSON data for AJAX requests
+func (d *Dashboard) apiHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	data := d.getDashboardData()
+	json.NewEncoder(w).Encode(data)
+}
+
+// wsHandler handles WebSocket connections
+func (d *Dashboard) wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// WebSocket upgrade error handled silently
+		return
+	}
+
+	// Register client with its own write mutex
+	d.clientsMutex.Lock()
+	d.clients[conn] = &sync.Mutex{}
+	d.clientsMutex.Unlock()
+
+	// Send initial data
+	data := d.getDashboardData()
+	conn.WriteJSON(data)
+
+	// Handle client disconnect
+	go func() {
+		defer func() {
+			d.clientsMutex.Lock()
+			delete(d.clients, conn)
+			d.clientsMutex.Unlock()
+			conn.Close()
+		}()
+
+		for {
+			// Keep connection alive
+			d.clientsMutex.RLock()
+			clientMutex, exists := d.clients[conn]
+			d.clientsMutex.RUnlock()
+
+			if !exists {
+				break
+			}
+
+			clientMutex.Lock()
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			clientMutex.Unlock()
+			if err != nil {
+				break
+			}
+
+			time.Sleep(30 * time.Second)
+		}
+	}()
+}
+
+// broadcastData sends data to all connected WebSocket clients
+func (d *Dashboard) broadcastData(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// exit broadcast
+			return
+		case <-ticker.C:
+			d.clientsMutex.Lock()
+			if len(d.clients) == 0 {
+				d.clientsMutex.Unlock()
+				continue
+			}
+
+			data := d.getDashboardData()
+			clientsToRemove := make([]*websocket.Conn, 0)
+
+			for client, clientMutex := range d.clients {
+				clientMutex.Lock()
+				err := client.WriteJSON(data)
+				clientMutex.Unlock()
+				if err != nil {
+					clientsToRemove = append(clientsToRemove, client)
+				}
+			}
+
+			for _, client := range clientsToRemove {
+				delete(d.clients, client)
+			}
+			d.clientsMutex.Unlock()
+		}
+	}
+}
+
+// getDashboardData collects all current market maker data
+func (d *Dashboard) getDashboardData() DashboardData {
+	// Pre-allocate slice with estimated capacity
+	pairsData := make([]PairData, 0, len(d.mm.traders))
+	var totalPnL, totalSize, totalValue float64
+	activePairs := 0
+
+	// Batch-fetch all positions and all orders
+	positionsMap := d.mm.Exchange.GetPositions()
+	ordersMap := make(map[string][]exchange.Order)
+	for pairName := range d.mm.traders {
+		orders, err := d.mm.Exchange.GetOrder(pairName)
+		if err == nil {
+			ordersMap[pairName] = orders
+		}
+	}
+
+	// Process each trader to collect data
+	for pairName, trader := range d.mm.traders {
+		pair, err := d.mm.Exchange.Pair(pairName)
+		if err != nil {
+			continue
+		}
+
+		// Get trader data under lock
+		trader.RLock()
+		totalVolume := trader.asksVol + trader.bidsVol
+		indexPrice := trader.MarkPrice
+		spreadAvg := trader.SpreadAvg
+		spread := trader.Spread
+		impactAvg := trader.ImpactAvg
+		imbalancePct := trader.imbalancePct
+		// risk indicators
+		volatilityPct := trader.VolatilityPct
+		tradeScore := trader.TradeScore
+		holdScore := trader.HoldScore
+		tradePerMinute := trader.tradePerMinute
+		trader.RUnlock()
+
+		if indexPrice == 0 {
+			continue
+		}
+
+		// Get inventory data using batch-fetched positions
+		pos, ok := positionsMap[pairName]
+		var inventorySize, avgPrice float64
+		if ok {
+			inventorySize = pos.Size
+			avgPrice = pos.AvgPrice
+		}
+
+		// Calculate PNL using trader's calculatePnL function (after unlocking to avoid deadlock)
+		inventoryPnL := pos.PNL
+		// Use Mark Price for percentage calculation to match Hyperliquid's implementation
+		// Hyperliquid uses Mark Price for all PnL calculations, not Index Price
+		// Calculate PnL percentage based on margin using pair leverage
+		pnlPercentage := pos.CalculatePNLPercentage(pair)
+		// Get pending orders for this pair using batch-fetched orders
+		// Include ALL orders regardless of status to avoid UI flicker during temp states
+		var pendingBuySize, pendingSellSize float64
+		if orders, ok := ordersMap[pairName]; ok {
+			for _, order := range orders {
+				orderSizeUsd := math.Abs(order.Size * order.Price) // Convert to USD value
+				switch order.Side {
+				case "buy":
+					pendingBuySize += orderSizeUsd
+				case "sell":
+					pendingSellSize += orderSizeUsd
+				default:
+				}
+			}
+		}
+
+		// Calculate total size (inventory + pending)
+		pairTotalSize := inventorySize + pendingBuySize - pendingSellSize
+
+		// Create PairData struct directly in the slice to avoid extra allocation
+		pairDataStruct := PairData{
+			Pair:            pairName,
+			IndexPrice:      indexPrice,
+			MarkPrice:       pair.MarkPrice,
+			FundingRate:     pair.FundingRate,
+			PremiumPct:      pair.PremiumPct,
+			SpreadAvg:       spreadAvg,
+			Spread:          spread,
+			ImpactAvg:       impactAvg,
+			Volume:          totalVolume,  // OB volume 10 levels
+			ImbalancePct:    imbalancePct, // Use trader's imbalance value
+			Volatility:      volatilityPct,
+			TradeScore:      tradeScore,
+			HoldScore:       holdScore,
+			TradeCounter:    tradePerMinute,
+			Inventory:       inventorySize,
+			PendingBuySize:  pendingBuySize,
+			PendingSellSize: pendingSellSize,
+			TotalSize:       pairTotalSize,
+			AvgPrice:        avgPrice,
+			PnL:             inventoryPnL,
+			PnLPct:          pnlPercentage,
+			Allowed:         trader.allowed,
+		}
+
+		// Calculate totals
+		totalPnL += inventoryPnL
+		totalSize += inventorySize * pairDataStruct.IndexPrice // Convert to USD for net position
+		totalValue += math.Abs(inventorySize * pairDataStruct.IndexPrice)
+
+		pairsData = append(pairsData, pairDataStruct)
+		activePairs++
+	}
+
+	// Get latency data
+	var latencyMs, maxLatencyMs int
+	latencyMs = int(d.mm.Exchange.GetLatency())
+	maxLatencyMs = 2000 // Default max latency of 2 seconds
+
+	totalBuySize, totalSellSize := d.mm.getTotalSizesUsd()
+	totalSizeUsd := totalBuySize + totalSellSize
+
+	return DashboardData{
+		PairsData:        pairsData,
+		LastUpdate:       time.Now(),
+		TotalPnL:         d.mm.getTotalPNL(),
+		TotalSize:        totalSize,    // Use calculated net position (inventory only, not pending)
+		TotalValue:       totalSizeUsd, // TotalValue is the same as TotalSize (absolute USD value)
+		ActivePairs:      activePairs,
+		LatencyMs:        latencyMs,
+		MaxLatencyMs:     maxLatencyMs,
+		InventorySkew:    d.mm.calculateInventorySkew(),
+		PositionBuySize:  totalBuySize,
+		PositionSellSize: totalSellSize,
+	}
+}

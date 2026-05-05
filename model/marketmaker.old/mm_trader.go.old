@@ -1,0 +1,550 @@
+package model
+
+import (
+	"log"
+	"marketmaker/exchange"
+	"math"
+	"time"
+)
+
+func (t *trader) collectTrades(trade *exchange.Trade) {
+	t.Lock()
+	defer t.Unlock()
+
+	insertWithLimitInPlace(&t.Trades, *trade, ARRAY_LENGTH)
+
+	t.VolatilityPct = t.calculateVolatilityPct(INDICATOR_LENGHT)
+	t.tradePerMinute = t.calculateTradesInDuration(time.Minute)
+
+	t.calculateImpact(trade.Fills)
+}
+
+// collectPrices collects prices and spreads
+func (t *trader) collectPrices(prices *[]exchange.Price) {
+	if len(*prices) != 2 {
+		return
+	}
+
+	bid := (*prices)[0].Price
+	ask := (*prices)[1].Price
+
+	if bid <= 0 || ask <= 0 {
+		return
+	}
+
+	mid := (ask + bid) / 2
+	spread := ask - bid
+	spreadPct := (spread / mid) * 100
+
+	// calculate volume imbalance
+	asksVol, bidsVol, imbalancePct := t.calculateOBVolImbalance(10)
+
+	t.Lock()
+	defer t.Unlock()
+
+	lastPrice := exchange.Price{
+		Price: mid,
+		Size:  -asksVol + bidsVol,
+		Time:  (*prices)[0].Time,
+	}
+	insertWithLimitInPlace(&t.Prices, lastPrice, ARRAY_LENGTH)
+
+	// Calculate spread average over rolling window capped by INDICATOR_LENGHT
+	totalSpreadPct := 0.0
+	window := len(t.spreadPct)
+	if window > 0 {
+		if window > INDICATOR_LENGHT {
+			window = INDICATOR_LENGHT
+		}
+		for i := 0; i < window; i++ {
+			totalSpreadPct += t.spreadPct[i]
+		}
+		t.SpreadAvg = totalSpreadPct / float64(window)
+	} else {
+		t.SpreadAvg = spreadPct
+	}
+
+	t.bestBid = bid
+	t.bestAsk = ask
+	t.asksVol = asksVol
+	t.bidsVol = bidsVol
+	t.imbalancePct = imbalancePct
+
+	insertWithLimitInPlace(&t.spreadPct, spreadPct, ARRAY_LENGTH)
+}
+
+func (t *trader) updateValues(pd *exchange.Pair) {
+
+	if pd == nil {
+		pdPtr, err := t.parent.Exchange.Pair(t.Pair)
+		if err != nil {
+			return
+		}
+		pd = &pdPtr
+	}
+
+	// read lock
+	t.RLock()
+	bestBid := t.bestBid
+	bestAsk := t.bestAsk
+	spreadPct := t.SpreadAvg
+	impactPct := t.ImpactAvg
+	volatilityPct := t.VolatilityPct
+	latencyMs := t.parent.Exchange.GetLatency()
+	tradesPerMin := t.tradePerMinute
+	lenTrades := len(t.Trades)
+	t.RUnlock()
+
+	// allow trade settings from config: 0 value means ignore the setting
+	newAllowed := true
+	if lenTrades < ARRAY_LENGTH*0.2 {
+		newAllowed = false
+	}
+	if t.parent.config.MinSpreadPct > 0 && spreadPct < t.parent.config.MinSpreadPct {
+		newAllowed = false
+	}
+	if t.parent.config.MaxSpreadPct > 0 && spreadPct > t.parent.config.MaxSpreadPct {
+		newAllowed = false
+	}
+	if t.parent.config.MinTradesPerMin > 0 && tradesPerMin < t.parent.config.MinTradesPerMin {
+		newAllowed = false
+	}
+	if t.parent.config.MaxTradesPerMin > 0 && tradesPerMin > t.parent.config.MaxTradesPerMin {
+		newAllowed = false
+	}
+	if t.parent.config.MinPairOI > 0 && pd.OpenInterest < t.parent.config.MinPairOI {
+		newAllowed = false
+	}
+	if t.parent.config.MaxPairOI > 0 && pd.OpenInterest > t.parent.config.MaxPairOI {
+		newAllowed = false
+	}
+	if t.parent.config.MinPairVolume > 0 && pd.Volume < t.parent.config.MinPairVolume {
+		newAllowed = false
+	}
+	if t.parent.config.MaxPairVolume > 0 && pd.Volume > t.parent.config.MaxPairVolume {
+		newAllowed = false
+	}
+	if pd.MarkPrice > 0 && pd.IndexPrice > 0 {
+		ratio := pd.MarkPrice / pd.IndexPrice
+		if ratio > 10 || ratio < 0.1 {
+			log.Printf("DISABLING BROKEN PAIR: %s - Mark: %.6f, Oracle: %.6f, Ratio: %.6f (Oracle Price appears broken)", t.Pair, pd.MarkPrice, pd.IndexPrice, ratio)
+			newAllowed = false
+		}
+	}
+
+	// calculate optimal prices and spread
+	inventorySkew := t.parent.calculateInventorySkew()
+	midPrice := (bestBid + bestAsk) / 2
+	maxDeviationPct := 1.0
+	indexPrice := getIndexPrice(midPrice, pd.MarkPrice, maxDeviationPct)
+	optimalPrice := calculateOptimalPrice(indexPrice, spreadPct, inventorySkew)
+	latencyPct := calculateLatencyBufferPct(latencyMs, spreadPct)
+	newSpreadPct, _, bidPrice, askPrice := calculateOptimalSpread(
+		optimalPrice,
+		t.parent.config.MakerFeePct,
+		t.parent.config.TakerFeePct,
+		0, // funding impact ignored for simplicity here
+		t.parent.config.MinProfitPct,
+		impactPct,
+		volatilityPct,
+		latencyPct,
+	)
+
+	// update in single lock
+	t.Lock()
+	defer t.Unlock()
+
+	t.MarkPrice = pd.MarkPrice
+	t.IndexPrice = pd.IndexPrice
+	t.Spread = newSpreadPct
+	t.Bid = bidPrice
+	t.Ask = askPrice
+
+	tradeScore := t.updateTradeScore(t.SpreadAvg)
+	holdScore := t.updateHoldScore(pd.PremiumPct, pd.FundingRate)
+	t.TradeScore = EMA(tradeScore, t.TradeScore, SCORE_EMA_ALPHA)
+	t.HoldScore = EMA(holdScore, t.HoldScore, SCORE_EMA_ALPHA)
+
+	if t.allowed != newAllowed {
+		t.allowed = newAllowed
+	}
+}
+
+// calculateSlippages calculates a spike/slippage-based score for the trader
+// based on how much price movement each trade creates (percentage spikes)
+func (t *trader) calculateImpact(fills []*exchange.Fill) {
+	if len(fills) == 0 || t.MarkPrice <= 0 {
+		return
+	}
+
+	var impactPct float64
+	var fillPrice float64
+
+	switch fills[0].Side {
+	case "buy":
+		maxPrice := fills[0].Price
+		for _, fill := range fills {
+			if fill.Price > maxPrice {
+				maxPrice = fill.Price
+			}
+		}
+		fillPrice = maxPrice
+		impactPct = ((maxPrice - t.MarkPrice) / t.MarkPrice) * 100
+
+	case "sell":
+		minPrice := fills[0].Price
+		for _, fill := range fills {
+			if fill.Price < minPrice {
+				minPrice = fill.Price
+			}
+		}
+		fillPrice = minPrice
+		impactPct = -((t.MarkPrice - minPrice) / t.MarkPrice) * 100
+
+	default:
+		return // unknown side
+	}
+
+	// Skip negligible impacts to avoid noise
+	if math.Abs(impactPct) < 0.01 {
+		return
+	}
+
+	// Only update if fill price has changed significantly
+	if t._lastFill > 0 && math.Abs(fillPrice-t._lastFill)/t._lastFill < 0.0001 {
+		return
+	}
+	t._lastFill = fillPrice
+
+	// Insert impactPct into rolling window and update average
+	insertWithLimitInPlace(&t.impactPct, impactPct, ARRAY_LENGTH)
+	t.updateImpactAvg()
+}
+
+// Weighted moving average for ImpactAvg to give more weight to recent impacts:
+func (t *trader) updateImpactAvg() {
+	var totalImpactPct float64
+	var totalWeight float64
+	var totalPositive float64
+	var totalNegative float64
+	var countPositive int
+	var countNegative int
+
+	// Apply exponential weighting over a capped rolling window of INDICATOR_LENGHT
+	n := len(t.impactPct)
+	if n > INDICATOR_LENGHT {
+		n = INDICATOR_LENGHT
+	}
+	for i := 0; i < n; i++ {
+		impactPct := t.impactPct[i]
+		weight := math.Pow(0.9, float64(n-i-1)) // Exponential decay within window
+		totalImpactPct += impactPct * weight
+		totalWeight += weight
+		if impactPct > 0 {
+			totalPositive += impactPct * weight
+			countPositive++
+		} else if impactPct < 0 {
+			totalNegative += impactPct * weight
+			countNegative++
+		}
+	}
+
+	if totalWeight > 0 {
+		// Compare the absolute values of total positive and total negative
+		if math.Abs(totalNegative) > totalPositive {
+			// Negative impact dominates
+			t.ImpactAvg = -math.Abs(totalNegative) / totalWeight
+		} else {
+			// Positive impact dominates or equal
+			t.ImpactAvg = totalPositive / totalWeight
+		}
+	} else {
+		t.ImpactAvg = 0
+	}
+}
+
+func (t *trader) prepareQuotes(bid, ask float64) (float64, float64) {
+	bestBid := t.bestBid
+	bestAsk := t.bestAsk
+	markPrice := t.MarkPrice
+
+	pd, _ := t.parent.Exchange.Pair(t.Pair)
+	tick := pd.Quote.TickSize
+
+	// Check if both sides would be instantly profitable
+	profitBuffer := markPrice * PROFIT_BUFFER_PCT
+	expectedProfitBid := markPrice - bestBid
+	expectedProfitAsk := bestAsk - markPrice
+	if expectedProfitBid > profitBuffer && expectedProfitAsk > profitBuffer {
+		adjustedBid := bestBid + tick
+		adjustedAsk := bestAsk - tick
+		log.Printf("ADJUSTED QUOTES FOR PROFIT: %s - Bid: %.6f, Ask: %.6f, Mark: %.6f (profit: %.2f%%)", t.Pair, adjustedBid, adjustedAsk, markPrice, math.Min(expectedProfitBid, expectedProfitAsk)*100)
+		return adjustedBid, adjustedAsk
+	}
+
+	// Normal safety checks to avoid instant fills
+	adjustedBid, adjustedAsk := bid, ask
+	if bestBid > 0 && bid >= bestAsk {
+		adjustedBid = bestAsk - tick
+		log.Printf("ADJUSTED BID TO PREVENT FILL: %s - Bid: %.6f, > BestAsk: %.6f, Adjusted: %.6f", t.Pair, bid, bestAsk, adjustedBid)
+	}
+	if bestAsk > 0 && ask <= bestBid {
+		adjustedAsk = bestBid + tick
+		log.Printf("ADJUSTED ASK TO PREVENT FILL: %s - Ask: %.6f, < BestBid: %.6f, Adjusted: %.6f", t.Pair, ask, bestBid, adjustedAsk)
+	}
+
+	return adjustedBid, adjustedAsk
+}
+
+func (t *trader) updateTradeScore(spreadAvg float64) float64 {
+	// Get orderbook for depth calculations (still needed for depth analysis)
+	ob, err := t.parent.Exchange.GetOrderbook(t.Pair)
+	if err != nil || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+		return 0
+	}
+
+	var topBid, topAsk, bidDepth, askDepth float64
+
+	for i := 0; i < 10 && i < len(ob.Bids); i++ {
+		bidDepth += ob.Bids[i].Size
+		if i < 2 {
+			topBid += ob.Bids[i].Size
+		}
+	}
+	for i := 0; i < 10 && i < len(ob.Asks); i++ {
+		askDepth += ob.Asks[i].Size
+		if i < 2 {
+			topAsk += ob.Asks[i].Size
+		}
+	}
+
+	price := ob.Asks[0].Price - ob.Bids[0].Price
+	// Quote-currency normalized
+	topDepth := topBid + topAsk*price
+	totalDepth := bidDepth + askDepth*price
+	if totalDepth == 0 {
+		return 0
+	}
+
+	// --- 1. targetSpread = for 100 spreadScore
+	targetSpread := 0.3 // = 100 score
+	spreadScore := math.Min(spreadAvg/targetSpread, 1.0) * 100
+
+	// --- 2. Total Depth Score (lower = best) ---
+	// Normalize to score: reverse logic — lower depth = higher score
+	// If depth > 20000 units, it gives ~0 score; small depth gives near 100
+	maxDepth := 200000.0
+	depthScore := (1.0 - math.Min(totalDepth/maxDepth, 1.0)) * 100
+
+	// --- 3. Liquidity Score (top depth ratio) ---
+	topDepthRatio := topDepth / totalDepth        // 0.0 (thin top), 1.0 (thick top)
+	liquidityScore := (1.0 - topDepthRatio) * 100 // thin top = higher score
+
+	// --- Combine Spread + Depth + Liquidity = baseScore
+	return spreadScore*0.6 + depthScore*0.2 + liquidityScore*0.2
+}
+
+func (t *trader) updateHoldScore(premiumPct float64, fundingRate float64) float64 {
+	// Funding rate is the base score (main driver)
+	fundingComponent := -fundingRate * 1000
+	// Premium can only amplify the funding score, never switch its sign
+	// If funding is positive, premium can only make it more positive
+	// If funding is negative, premium can only make it more negative
+	premiumComponent := -premiumPct * 10
+	// Calculate hold score with premium amplification
+	var score float64
+	if fundingComponent >= 0 {
+		// Funding is positive - premium can only amplify positively
+		score = fundingComponent + math.Max(0, premiumComponent)
+	} else {
+		// Funding is negative - premium can only amplify negatively
+		score = fundingComponent + math.Min(0, premiumComponent)
+	}
+
+	return score
+}
+
+// calculateOBVolImbalance calculates the imbalance between bid and ask sizes
+// over the top N levels of the orderbook.
+// Returns imbalance in percent: positive means more bids, negative means more asks.
+func (t *trader) calculateOBVolImbalance(levels int) (float64, float64, float64) {
+	ob, err := t.parent.Exchange.GetOrderbook(t.Pair)
+	if err != nil {
+		return 0.0, 0.0, 0.0
+	}
+
+	if len(ob.Bids) == 0 || len(ob.Asks) == 0 || levels <= 0 {
+		return 0.0, 0.0, 0.0
+	}
+
+	bidDepth := 0.0
+	askDepth := 0.0
+
+	// Sum top N bid sizes
+	for i := 0; i < levels && i < len(ob.Bids); i++ {
+		bidDepth += ob.Bids[i].Size
+	}
+
+	// Sum top N ask sizes
+	for i := 0; i < levels && i < len(ob.Asks); i++ {
+		askDepth += ob.Asks[i].Size
+	}
+
+	totalDepth := bidDepth + askDepth
+	if totalDepth == 0 {
+		return 0.0, 0.0, 0.0
+	}
+
+	asksVolume := askDepth * ob.Asks[0].Price
+	bidsVolume := bidDepth * ob.Bids[0].Price
+	imbalance := (bidDepth - askDepth) / totalDepth
+
+	return asksVolume, bidsVolume, imbalance * 100.0
+}
+
+// instant checks whether immediate market entry and exit at mark price
+// would be profitable after accounting for 2x taker fees and a buffer
+// threshold in percent (e.g., bufferPct=0.01 means 0.01%).
+// If profitable, it submits the entry with a linked TP trigger.
+// Expected prices layout: prices[0] = best bid, prices[1] = best ask.
+func (t *trader) instant(prices *[]exchange.Price, bufferPct float64) {
+	if prices == nil || len(*prices) != 2 {
+		return
+	}
+
+	bid := (*prices)[0].Price
+	ask := (*prices)[1].Price
+	if bid <= 0 || ask <= 0 {
+		return
+	}
+
+	// Read current mark price
+	t.RLock()
+	mark := t.MarkPrice
+	t.RUnlock()
+	if mark <= 0 {
+		return
+	}
+
+	// Determine default units from configured USD size
+	feeRate := t.parent.config.TakerFeePct // decimal (e.g., 0.00432 for 0.432%)
+	baseUsd := t.parent.config.BaseOrderSizeUsd
+	if baseUsd <= 0 {
+		return
+	}
+
+	// Long test: buy at ask, close at mark
+	longUnits := baseUsd / ask
+	longNotional := ask * longUnits
+	longGross := (mark - ask) * longUnits
+	longFees := 2 * feeRate * longNotional
+	longBuffer := (bufferPct / 100.0) * longNotional
+	longNet := longGross - longFees - longBuffer
+
+	// Short test: sell at bid, close at mark
+	shortUnits := baseUsd / bid
+	shortNotional := bid * shortUnits
+	shortGross := (bid - mark) * shortUnits
+	shortFees := 2 * feeRate * shortNotional
+	shortBuffer := (bufferPct / 100.0) * shortNotional
+	shortNet := shortGross - shortFees - shortBuffer
+
+	// Choose the better side if any is profitable
+	type decision struct {
+		side   string
+		size   float64
+		netUsd float64
+	}
+
+	var best decision
+	if longNet > 0 || shortNet > 0 {
+		if longNet >= shortNet {
+			best = decision{side: "buy", size: longUnits, netUsd: longNet}
+		} else {
+			best = decision{side: "sell", size: shortUnits, netUsd: shortNet}
+		}
+	} else {
+		return
+	}
+
+	// Part 1: Market entry order
+	entry := exchange.Order{
+		Pair:       t.Pair,
+		Side:       best.side,
+		Type:       "market",
+		Size:       best.size,
+		Price:      0,
+		ReduceOnly: false,
+	}
+
+	// Part 2: Immediate market close trigger order (not grouped)
+	closeSide := "sell"
+	if best.side == "sell" {
+		closeSide = "buy"
+	}
+
+	// Set trigger price very close to current price for immediate execution
+	var triggerPrice float64
+	var pct float64
+	if best.side == "buy" {
+		triggerPrice = mark * 0.999 // 0.1% below mark for immediate trigger
+		pct = (triggerPrice - mark) / mark * 100
+	} else {
+		triggerPrice = mark * 1.001 // 0.1% above mark for immediate trigger
+		pct = (mark - triggerPrice) / mark * 100
+	}
+
+	close := exchange.Order{
+		Pair:         t.Pair,
+		Side:         closeSide,
+		Type:         "limit", // Will become trigger order due to TriggerPrice
+		Size:         best.size,
+		Price:        0, // Market execution when triggered
+		ReduceOnly:   true,
+		TriggerPrice: triggerPrice, // Trigger at this price
+		TriggerType:  "market",     // Market execution when triggered
+		TakeProfit:   false,        // DONT Use TP grouping
+	}
+
+	// Send both orders together - the exchange layer will handle grouping appropriately
+	if err := t.parent.Exchange.PlaceOrders([]exchange.Order{entry, close}); err != nil {
+		log.Printf("instant: failed placing order for %s: %v", t.Pair, err)
+		return
+	}
+
+	log.Printf("instant: %s %s %.6f -> immediate close @ %.6f - expected PnL $%+.2f (%+.2f%%)", t.Pair, best.side, best.size, triggerPrice, best.netUsd, pct)
+}
+
+// getExposureUsd calculates total buy and sell exposure in USD (inventory + pending orders) for the pair
+func (t *trader) getExposureUsd() (float64, float64) {
+	// Get position and orders for this pair
+	pos, err := t.parent.Exchange.GetPosition(t.Pair)
+	if err != nil {
+		return 0, 0
+	}
+
+	orders := t.parent.Exchange.GetOrders()
+
+	var buySumUsd float64
+	var sellSumUsd float64
+
+	// Position exposure
+	if pos.Size > 0 {
+		buySumUsd += math.Abs(pos.Size) * pos.AvgPrice
+	} else if pos.Size < 0 {
+		sellSumUsd += math.Abs(pos.Size) * pos.AvgPrice
+	}
+
+	// Orders exposure
+	for _, order := range orders {
+		if order.Pair == t.Pair {
+			if order.Size > 0 {
+				buySumUsd += math.Abs(order.Size) * order.Price
+			} else if order.Size < 0 {
+				sellSumUsd += math.Abs(order.Size) * order.Price
+			}
+		}
+	}
+
+	return buySumUsd, sellSumUsd
+}

@@ -1,0 +1,1012 @@
+package model
+
+import (
+	"context"
+	"log"
+	"marketmaker/config"
+	"marketmaker/exchange"
+	"marketmaker/exchange/hyperliquid"
+	"math"
+	"sort"
+	"sync"
+	"time"
+)
+
+const (
+	ARRAY_LENGTH       = 100
+	INDICATOR_LENGHT   = 100
+	SCORE_CHANGE_RATIO = 0.3
+	SCORE_EMA_ALPHA    = 0.2
+
+	SKEW_START        = 0.7
+	SKEW_STEP         = 0.05
+	PROFIT_BUFFER_PCT = 0.02
+)
+
+// MarketMaker is the main engine that manages exchange connection and global config
+type MarketMaker struct {
+	Exchange exchange.I
+	config   *config.ModelConfig
+	traders  map[string]*trader
+	Skew     float64
+	process  chan struct{} // Channel semaphore to ensure only one instance runs at a time
+}
+
+// trader is a pair-specific tradingg instance with its own world/settings
+type trader struct {
+	parent         *MarketMaker
+	Pair           string
+	allowed        bool
+	Prices         []exchange.Price
+	Trades         []exchange.Trade
+	impactPct      []float64 // Rolling window of impact
+	ImpactAvg      float64   // Impact average (index - worst fill)
+	spreadPct      []float64
+	SpreadAvg      float64 // Orderbook Soread average
+	Spread         float64 // computed Spread
+	Bid            float64 // computed Bid
+	Ask            float64 // computed Ask
+	VolatilityPct  float64 // Volatility (last tradeprice - trade price)
+	_lastFill      float64 // Last maximum fill price to avoid redundant score calculations
+	TradeScore     float64 // Trade score: based on spread
+	HoldScore      float64 // Hold score: based on holding profability
+	MarkPrice      float64 // Mark price (current market price)
+	IndexPrice     float64 // Index price (oracle price)
+	tradePerMinute int     // Counter for monitoring trade frequency
+	bestBid        float64 // Best bid
+	bestAsk        float64 // Best ask
+	asksVol        float64
+	bidsVol        float64
+	imbalancePct   float64
+	_trailStopBuy  float64
+	_trailStopSell float64
+	// Fill/resting-time tracking
+	FillEvents        []Analytics // newest first, capped by ARRAY_LENGTH
+	_lastPosSize      float64     // last observed position size for this pair
+	_posInitialized   bool        // whether _lastPosSize has been initialized
+	LastQuoteTimeBuy  time.Time   // last time we posted a buy quote (optional)
+	LastQuoteTimeSell time.Time   // last time we posted a sell quote (optional)
+	sync.RWMutex
+}
+
+// NewMarketMaker creates the main engine and automatically adds pair traders for all pairs
+func NewMarketMaker(exch exchange.I, cfg *config.ModelConfig) *MarketMaker {
+	mm := &MarketMaker{
+		Exchange: exch,
+		config:   cfg,
+		traders:  make(map[string]*trader),
+		process:  make(chan struct{}, 1), // Channel semaphore with size 1
+	}
+
+	// Build traders
+	allowedSet := make(map[string]struct{})
+
+	if len(cfg.Pairs) == 0 {
+		// Allow all pairs from exchange
+		for pair, pairInfo := range exch.GetPairs() {
+			// Check required pair conditions: must be enabled and must be perpetual
+			if !pairInfo.Enabled || !pairInfo.IsPerp {
+				continue
+			}
+			allowedSet[pair] = struct{}{}
+		}
+	} else {
+		// Only allow those in the list
+		for _, pair := range cfg.Pairs {
+			// Check if pair exists on exchange and meets conditions
+			if pairInfo, ok := exch.GetPairs()[pair]; ok {
+				if !pairInfo.Enabled || !pairInfo.IsPerp {
+					continue
+				}
+				allowedSet[pair] = struct{}{}
+			}
+		}
+	}
+
+	// Remove disabled pairs if any
+	if len(cfg.DisabledPairs) > 0 {
+		for _, p := range cfg.DisabledPairs {
+			delete(allowedSet, p)
+		}
+	}
+
+	// Create traders for allowed pairs
+	for pair := range allowedSet {
+		mm.traders[pair] = Newtrader(mm, pair)
+	}
+
+	return mm
+}
+
+// Newtrader creates a new pair-specific trading instance
+func Newtrader(parent *MarketMaker, pair string) *trader {
+	return &trader{
+		parent:            parent,
+		Pair:              pair,
+		allowed:           false,
+		Prices:            make([]exchange.Price, 0, ARRAY_LENGTH),
+		Trades:            make([]exchange.Trade, 0, ARRAY_LENGTH),
+		impactPct:         make([]float64, 0, ARRAY_LENGTH),
+		ImpactAvg:         0,
+		spreadPct:         make([]float64, 0, ARRAY_LENGTH),
+		SpreadAvg:         0,
+		Spread:            0,
+		Bid:               0,
+		Ask:               0,
+		MarkPrice:         0,
+		IndexPrice:        0,
+		VolatilityPct:     0,
+		TradeScore:        0,
+		HoldScore:         0,
+		tradePerMinute:    0,
+		asksVol:           0,
+		bidsVol:           0,
+		_lastFill:         0,
+		imbalancePct:      0,
+		_trailStopBuy:     0,
+		_trailStopSell:    0,
+		FillEvents:        make([]Analytics, 0, ARRAY_LENGTH),
+		_lastPosSize:      0,
+		_posInitialized:   false,
+		LastQuoteTimeBuy:  time.Time{},
+		LastQuoteTimeSell: time.Time{},
+	}
+}
+
+// Start the market maker and all its pair traders
+func (mm *MarketMaker) Start(ctx context.Context) {
+	// Create ticker for main calculations - runs every ms interval instead of on every pair update
+	mainTicker := time.NewTicker(time.Duration(mm.config.UpdateIntervalMs) * time.Millisecond)
+	defer mainTicker.Stop()
+	syncTicker := time.NewTicker(5 * time.Minute)
+	defer syncTicker.Stop()
+
+	for {
+		select {
+		case <-syncTicker.C:
+			if hl, ok := mm.Exchange.(*hyperliquid.Hyperliquid); ok {
+				if err := hl.UpdateOrders(); err != nil {
+					log.Printf("Failed to update orders: %v", err)
+				}
+			}
+		case pu := <-mm.Exchange.GetPositionUpdates():
+			// Update fill events
+			if t, exists := mm.traders[pu.Pair]; exists {
+				go t.collectFillEvents(pu.Data)
+			}
+
+		case tu := <-mm.Exchange.GetTradeUpdates():
+			// Update trade data
+			if t, exists := mm.traders[tu.Pair]; exists {
+				go t.collectTrades(tu.Data)
+			}
+
+		case pr := <-mm.Exchange.GetPricesUpdates():
+			// Update prices data
+			if t, exists := mm.traders[pr.Pair]; exists {
+				go t.instant(pr.Data, PROFIT_BUFFER_PCT)
+				go t.collectPrices(pr.Data)
+			}
+
+		case pd := <-mm.Exchange.GetPairUpdates():
+			// Update trader values
+			if t, exists := mm.traders[pd.Pair]; exists {
+				go t.updateValues(pd.Data)
+			}
+		case <-mainTicker.C:
+			// MarketMaker main loop - run evaluation using channel semaphore
+
+			// go func() {
+			// 	select {
+			// 	case mm.process <- struct{}{}:
+			// 		// Acquired a process
+
+			// 		mm.waitNoTemp()
+
+			// 		if !mm.update() {
+			// 			mm.quote()
+			// 		}
+
+			// 		// Release the process
+			// 		<-mm.process
+			// 	default:
+			// 	}
+			// }()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// Stop cancels all open orders and closes all positions for enabled pairs.
+// Pairs listed in config DisabledPairs are skipped (no order cancel/position close).
+func (mm *MarketMaker) Stop() {
+	// Build disabled set for quick lookup
+	disabled := make(map[string]struct{}, len(mm.config.DisabledPairs))
+	for _, p := range mm.config.DisabledPairs {
+		disabled[p] = struct{}{}
+	}
+
+	// Cancel open orders for enabled pairs only
+	existingOrders := mm.Exchange.GetOrders()
+	ordersToCancel := make([]exchange.Order, 0, len(existingOrders))
+	for _, o := range existingOrders {
+		if _, skip := disabled[o.Pair]; skip {
+			continue
+		}
+		ordersToCancel = append(ordersToCancel, o)
+	}
+	if len(ordersToCancel) > 0 {
+		mm.Exchange.CancelOrders(ordersToCancel)
+	}
+
+	// Close positions with market reduce-only orders for enabled pairs only
+	positions := mm.Exchange.GetPositions()
+	closeOrders := make([]exchange.Order, 0, len(positions))
+	for pair, pos := range positions {
+		if pos.Size == 0 {
+			continue
+		}
+		if _, skip := disabled[pair]; skip {
+			continue
+		}
+		var side string
+		switch {
+		case pos.Size < 0:
+			side = "buy"
+		default:
+			side = "sell"
+		}
+		closeOrders = append(closeOrders, exchange.Order{
+			Pair:       pair,
+			Side:       side,
+			Type:       "market",
+			Size:       math.Abs(pos.Size),
+			Price:      0,
+			ReduceOnly: true,
+		})
+	}
+	if len(closeOrders) > 0 {
+		mm.Exchange.PlaceOrders(closeOrders)
+	}
+
+	mm.traders = nil
+	mm.Exchange = nil
+	mm.config = nil
+	log.Println("MarketMaker stopped!")
+}
+
+// getTotalNetUsd returns the total net position size in USD across all traders (positive = net long, negative = net short)
+func (mm *MarketMaker) getTotalNetUsd() float64 {
+	positions := mm.Exchange.GetPositions()
+	var netUsd float64
+
+	for _, pos := range positions {
+		// Use position's average price for net calculation
+		netUsd += pos.Size * pos.AvgPrice
+	}
+
+	return netUsd
+}
+
+// getTotalOrdersUsd returns the total buy and sell order exposure in USD across all traders (orders only, not positions)
+func (mm *MarketMaker) getTotalOrdersUsd() (float64, float64) {
+	orders := mm.Exchange.GetOrders()
+	var buySumUsd float64
+	var sellSumUsd float64
+
+	for _, order := range orders {
+		switch order.Side {
+		case "buy":
+			buySumUsd += math.Abs(order.Size) * order.Price
+		case "sell":
+			sellSumUsd += math.Abs(order.Size) * order.Price
+		default:
+			// do nothing for unknown side
+		}
+	}
+
+	return buySumUsd, sellSumUsd
+}
+
+// getTotalSizeUsd returns the total absolute position size in USD across all traders
+func (mm *MarketMaker) getTotalSizesUsd() (float64, float64) {
+	positions := mm.Exchange.GetPositions()
+	var buySumUsd float64
+	var sellSumUsd float64
+
+	for _, pos := range positions {
+		switch {
+		case pos.Size > 0:
+			buySumUsd += math.Abs(pos.Size) * pos.AvgPrice
+		case pos.Size < 0:
+			sellSumUsd += math.Abs(pos.Size) * pos.AvgPrice
+		default:
+		}
+	}
+
+	return buySumUsd, sellSumUsd
+}
+
+// getTotalExposureUsd calculates total exposure in USD across all pairs (inventory + pending orders)
+func (mm *MarketMaker) getTotalExposureUsd() (float64, float64) {
+	orders := mm.Exchange.GetOrders()
+	positions := mm.Exchange.GetPositions()
+	var buySumUsd float64
+	var sellSumUsd float64
+
+	// Count all positions
+	for _, pos := range positions {
+		// Use the position's average price for exposure calculation
+		price := pos.AvgPrice
+		posExposure := math.Abs(pos.Size) * price
+		switch {
+		case pos.Size > 0:
+			buySumUsd += posExposure
+		case pos.Size < 0:
+			sellSumUsd += posExposure
+		default:
+			// do nothing for zero size
+		}
+	}
+
+	// Count all orders
+	for _, order := range orders {
+		orderExposure := math.Abs(order.Size) * order.Price
+		switch order.Side {
+		case "buy":
+			buySumUsd += orderExposure
+		case "sell":
+			sellSumUsd += orderExposure
+		default:
+			// do nothing for unknown side
+		}
+	}
+
+	return buySumUsd, sellSumUsd
+}
+
+// getTotalPNL returns the aggregated PNL across all traders
+func (mm *MarketMaker) getTotalPNL() float64 {
+	var totalPNL float64
+
+	positions := mm.Exchange.GetPositions()
+	for _, pos := range positions {
+		totalPNL += pos.PNL
+	}
+
+	return totalPNL
+}
+
+// calculateInventorySkew returns the inventory skew value between -1 and 1.
+// - Then skews smoothly from 0 → ±1 as you approach max
+func (mm *MarketMaker) calculateInventorySkew() float64 {
+	netPos := mm.getTotalNetUsd()
+	targetInv := mm.config.TargetInventoryUsd
+	maxInv := mm.config.MaxInventoryUsd
+	if maxInv == 0 || targetInv == 0 {
+		return 0
+	}
+
+	// Calculate skew threshold (70% of max inventory)
+	threshold := SKEW_START * maxInv
+
+	// If within threshold, no skew
+	if math.Abs(netPos) <= threshold {
+		return 0
+	}
+
+	// Calculate skew with sign preserved
+	excess := math.Abs(netPos) - threshold
+	skew := excess / (maxInv - threshold)
+	if netPos < 0 {
+		skew = -skew
+	}
+
+	// Clamp skew to [-1, 1]
+	if skew > 1 {
+		skew = 1
+	} else if skew < -1 {
+		skew = -1
+	}
+
+	// Quantize to step increments
+	quantized := math.Round(skew/SKEW_STEP) * SKEW_STEP
+	return quantized
+}
+
+func (mm *MarketMaker) waitNoTemp() {
+	var ok bool
+	for {
+		// Check for any temp orders - if found, skip this evaluation cycle
+		existingOrders := mm.Exchange.GetOrders()
+		ok = true
+		for _, o := range existingOrders {
+			// Check for temp status OR client order IDs (0x...)
+			if o.Status == "temp" || (len(o.ID) > 2 && o.ID[:2] == "0x") {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		// No temp orders found, return
+		return
+	}
+}
+
+func (mm *MarketMaker) quote() bool {
+	targetInventory := mm.config.TargetInventoryUsd
+	maxInventory := mm.config.MaxInventoryUsd
+	// position exposure
+	totalBuyPos, totalSellPos := mm.getTotalSizesUsd()
+	totalPos := totalBuyPos + totalSellPos
+	// order exposure
+	totalBuyOrders, totalSellOrders := mm.getTotalOrdersUsd()
+	totalOrders := totalBuyOrders + totalSellOrders
+
+	totalRemainingExposure := targetInventory - totalOrders
+	if totalRemainingExposure < mm.config.MinOrderSizeUsd {
+		return false
+	}
+
+	totalNet := mm.getTotalNetUsd()
+
+	posOverTarget := totalPos > targetInventory
+	posOverLimit := totalPos > maxInventory
+
+	type scoredTrader struct {
+		trader      *trader
+		score       float64
+		allowed     bool
+		hasPosition bool
+	}
+
+	scoredTraders := make([]scoredTrader, 0, len(mm.traders))
+	for _, t := range mm.traders {
+		// Read trader state atomically
+		t.RLock()
+		score := t.TradeScore
+		allowed := t.allowed
+		pair := t.Pair
+		t.RUnlock()
+
+		// Determine if we already have a position on this pair
+		pos, err := mm.Exchange.GetPosition(pair)
+		hasPosition := err == nil && math.Abs(pos.Size) > 0
+
+		// If not allowed and no position, skip. If not allowed but has position, include to reduce
+		if !allowed && !hasPosition {
+			continue
+		}
+		// Apply threshold only when we do NOT have a position
+		if !hasPosition && mm.config.TradeScoreThreshold > 0 && math.Abs(score) < mm.config.TradeScoreThreshold {
+			continue
+		}
+
+		scoredTraders = append(scoredTraders, scoredTrader{trader: t, score: score, allowed: allowed, hasPosition: hasPosition})
+	}
+
+	if len(scoredTraders) == 0 {
+		return false
+	}
+
+	ordersToPlace := make([]exchange.Order, 0, len(scoredTraders))
+
+	sort.Slice(scoredTraders, func(i, j int) bool {
+		// Prioritize pairs with existing positions first
+		if scoredTraders[i].hasPosition != scoredTraders[j].hasPosition {
+			return scoredTraders[i].hasPosition && !scoredTraders[j].hasPosition
+		}
+		// Then by absolute score
+		return math.Abs(scoredTraders[i].score) > math.Abs(scoredTraders[j].score)
+	})
+
+	for _, st := range scoredTraders {
+		position, _ := mm.Exchange.GetPosition(st.trader.Pair)
+		posAbs := math.Abs(position.Size)
+
+		st.trader.RLock()
+		price := st.trader.MarkPrice
+		st.trader.RUnlock()
+
+		bid, ask := true, true
+		sizeUnits := mm.config.BaseOrderSizeUsd / price // default in units
+		sizeAdjusted := false
+		reduceOnly := false
+
+		// Over hard limit
+		if posOverLimit {
+			if !st.hasPosition {
+				continue
+			}
+			sizeUnits = posAbs
+			sizeAdjusted = true
+			reduceOnly = true
+			if position.Size > 0 {
+				bid = false
+			} else if position.Size < 0 {
+				ask = false
+			}
+		} else if posOverTarget {
+			if totalNet > 0 {
+				bid = false
+			} else if totalNet < 0 {
+				ask = false
+			}
+			if (totalNet > 0 && position.Size > 0) || (totalNet < 0 && position.Size < 0) {
+				sizeUnits = math.Min(posAbs, sizeUnits)
+				sizeAdjusted = true
+			}
+		}
+
+		// Trader-specific restriction
+		if st.hasPosition && !st.allowed {
+			sizeUnits = posAbs
+			sizeAdjusted = true
+			reduceOnly = true
+			if position.Size > 0 {
+				bid = false
+			} else if position.Size < 0 {
+				ask = false
+			}
+		}
+
+		// Final size clamp in USD terms
+		sizeUsd := sizeUnits * price
+		sizeUsd = math.Min(sizeUsd, mm.config.MaxOrderSizeUsd)
+		sizeUsd = math.Max(sizeUsd, mm.config.MinOrderSizeUsd)
+		sizeUnits = sizeUsd / price
+
+		want := 0
+		if bid {
+			want++
+		}
+		if ask {
+			want++
+		}
+
+		required := float64(want) * mm.config.BaseOrderSizeUsd
+		if !reduceOnly && !st.hasPosition && totalRemainingExposure < required {
+			continue
+		}
+
+		orders := mm.getOrders(st.trader, bid, ask)
+
+		for _, order := range orders {
+			order.ReduceOnly = reduceOnly
+			if sizeAdjusted {
+				order.Size = sizeUnits
+			}
+			ordersToPlace = append(ordersToPlace, order)
+
+			if !reduceOnly {
+				totalRemainingExposure -= order.Size * order.Price
+			}
+			log.Printf("quote: %s %s %s %.6f @ %.6f (score: %.2f) (total %d)", order.Type, order.Side, order.Pair, order.Size, order.Price, st.score, len(mm.Exchange.GetOrders()))
+
+			// Record last quote times for resting-time estimation only when we actually place quotes
+			switch order.Side {
+			case "buy":
+				st.trader.LastQuoteTimeBuy = time.Now()
+			case "sell":
+				st.trader.LastQuoteTimeSell = time.Now()
+			default:
+			}
+		}
+	}
+
+	if len(ordersToPlace) > 0 {
+		if err := mm.Exchange.PlaceOrders(ordersToPlace); err != nil {
+			log.Printf("Failed to place orders: %v", err)
+			return false
+		}
+		return true
+	}
+
+	return false
+}
+
+func (mm *MarketMaker) getOrders(trader *trader, bid, ask bool) []exchange.Order {
+	trader.RLock()
+	bidPrice, askPrice := trader.prepareQuotes(trader.Bid, trader.Ask)
+	indexPrice := trader.IndexPrice // Use index price for consistent size calculation
+	trader.RUnlock()
+
+	var orderPrice float64
+	perOrderUsd := mm.config.BaseOrderSizeUsd
+
+	orders := make([]exchange.Order, 0, 2)
+	existingOrders := mm.Exchange.GetOrders()
+
+	// Calculate size once using index price so both buy and sell have same size
+	size := perOrderUsd / indexPrice
+	maxSize := mm.config.MaxOrderSizeUsd / indexPrice
+	if size > maxSize {
+		size = maxSize
+	}
+
+	for _, side := range [2]string{"buy", "sell"} {
+		skip := false
+		switch side {
+		case "buy":
+			if !bid {
+				continue
+			}
+			orderPrice = bidPrice
+		case "sell":
+			if !ask {
+				continue
+			}
+			orderPrice = askPrice
+		}
+
+		// Check existing orders for same pair/side (any status)
+		for _, o := range existingOrders {
+			if o.Pair == trader.Pair && o.Side == side {
+				skip = true
+				break
+			}
+		}
+
+		// Check pending orders in same batch
+		if !skip {
+			for _, pendingOrder := range orders {
+				if pendingOrder.Pair == trader.Pair && pendingOrder.Side == side {
+					skip = true
+					break
+				}
+			}
+		}
+
+		if skip {
+			continue
+		}
+		if size <= 0 {
+			continue
+		}
+		order := exchange.Order{
+			Pair:     trader.Pair,
+			Price:    orderPrice,
+			Size:     size, // Same size for both buy and sell orders
+			Side:     side,
+			Type:     "limit",
+			PostOnly: true,
+		}
+		orders = append(orders, order)
+		// log.Printf("quote: %s %s %s %.6f @ %.6f (total %d)", order.Type, order.Side, order.Pair, order.Size, order.Price, len(existingOrders))
+	}
+
+	return orders
+}
+
+func (mm *MarketMaker) update() bool {
+	existingOrders := mm.Exchange.GetOrders()
+	if len(existingOrders) == 0 {
+		return false
+	}
+
+	// Precompute helper maps for current state
+	positions := mm.Exchange.GetPositions()
+	hasOrder := make(map[string]bool, len(existingOrders))
+	orderCount := make(map[string]int, len(existingOrders)) // Count orders per pair+side
+
+	for _, o := range existingOrders {
+		hasOrder[o.Pair] = true
+		pairSide := o.Pair + "_" + o.Side
+		orderCount[pairSide]++
+	}
+
+	// Build ranked candidate list (no position, no orders, allowed)
+	type scoredTrader struct {
+		pair  string
+		score float64 // absolute value for ordering
+	}
+	scoredTraders := make([]scoredTrader, 0, len(mm.traders))
+	for pair, t := range mm.traders {
+		t.RLock()
+		score := t.TradeScore
+		allowed := t.allowed
+		t.RUnlock()
+		if !allowed {
+			continue
+		}
+		if pos, ok := positions[pair]; ok && pos.Size != 0 {
+			continue
+		}
+		if hasOrder[pair] {
+			continue
+		}
+		scoredTraders = append(scoredTraders, scoredTrader{pair: pair, score: math.Abs(score)})
+	}
+	sort.Slice(scoredTraders, func(i, j int) bool { return scoredTraders[i].score > scoredTraders[j].score })
+
+	ordersToModify := make([]exchange.Order, 0, len(existingOrders))
+	ordersToCancel := make([]exchange.Order, 0, len(existingOrders))
+	cancelIDs := make(map[string]struct{}, len(existingOrders))
+	bestIdx := 0
+
+	for _, order := range existingOrders {
+		trader, exists := mm.traders[order.Pair]
+		if !exists {
+			continue
+		}
+
+		// Check for duplicate orders on same pair+side and cancel extras
+		pairSide := order.Pair + "_" + order.Side
+		if orderCount[pairSide] > 1 {
+			// Keep the first order, cancel the rest
+			orderCount[pairSide]--
+			if orderCount[pairSide] > 0 {
+				ordersToCancel = append(ordersToCancel, order)
+				log.Printf("update: cancel %s %s %s %.6f @ %.6f (duplicate order)", order.Type, order.Side, order.Pair, order.Size, order.Price)
+				continue
+			}
+		}
+
+		trader.RLock()
+		allowed := trader.allowed
+		score := trader.TradeScore
+		bidPrice, askPrice := trader.prepareQuotes(trader.Bid, trader.Ask)
+		trader.RUnlock()
+
+		// Cancel all orders if trader is not allowed (except reduce-only)
+		if !allowed && !order.ReduceOnly {
+			ordersToCancel = append(ordersToCancel, order)
+			log.Printf("update: cancel %s %s %s %.6f @ %.6f (trader not allowed)", order.Type, order.Side, order.Pair, order.Size, order.Price)
+			continue
+		}
+
+		// Cancel non-reduce-only orders if score below threshold
+		if !order.ReduceOnly && mm.config.TradeScoreThreshold > 0 {
+			cancelThreshold := mm.config.TradeScoreThreshold * (1.0 - SCORE_CHANGE_RATIO)
+			if math.Abs(score) < cancelThreshold {
+				if _, seen := cancelIDs[order.ID]; !seen {
+					ordersToCancel = append(ordersToCancel, order)
+					cancelIDs[order.ID] = struct{}{}
+				}
+				log.Printf("update: cancel %s %s %s %.6f @ %.6f (score %+.2f below threshold)", order.Type, order.Side, order.Pair, order.Size, order.Price, score)
+				continue
+			}
+		}
+
+		// Migration rule: consider best candidate from ranked list
+		if len(scoredTraders) > 0 && !order.ReduceOnly {
+			if pos := positions[order.Pair]; pos.Size == 0 {
+				if bestIdx < len(scoredTraders) {
+					best := scoredTraders[bestIdx]
+					if best.pair == order.Pair {
+						continue
+					}
+					if best.score > score*(1.0+SCORE_CHANGE_RATIO) {
+						// Only process if we have NOT already added to cancels
+						if _, seen := cancelIDs[order.ID]; !seen {
+							ordersToCancel = append(ordersToCancel, order)
+							cancelIDs[order.ID] = struct{}{}
+							log.Printf("update: cancel %s %s %s %.6f @ %.6f (better %s score %+.2f >> this %+.2f)", order.Type, order.Side, order.Pair, order.Size, order.Price, best.pair, best.score, score)
+							// Consume this candidate
+							bestIdx++
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		// Calculate new target price based on side
+		var newPrice float64
+		switch order.Side {
+		case "buy":
+			newPrice = bidPrice
+		case "sell":
+			newPrice = askPrice
+		default:
+			continue
+		}
+
+		// Track if we need to modify this order
+		mod := false
+		// Check if we should update order size based on difference from base size
+		if mm.config.SizeUpdateDiff > 0 {
+			// Calculate current base size using current index price
+			baseSize := mm.config.BaseOrderSizeUsd / trader.MarkPrice
+			maxSize := mm.config.MaxOrderSizeUsd / trader.MarkPrice
+			if baseSize > maxSize {
+				baseSize = maxSize
+			}
+
+			sizeDiffPct := math.Abs(order.Size-baseSize) / baseSize * 100
+
+			if sizeDiffPct > mm.config.SizeUpdateDiff {
+				log.Printf("update: modify %s %s %s %.6f -> %.6f (size diff %.2f%%)", order.Type, order.Side, order.Pair, order.Size, baseSize, sizeDiffPct)
+				order.Size = baseSize
+				mod = true
+			}
+		}
+
+		// Update order price if it changed more then our threshold
+		if newPrice != order.Price {
+			// Reduce-only orders are not updated
+			if !mm.config.UpdateReduceOrders && order.ReduceOnly {
+				continue
+			}
+
+			priceChangePct := math.Abs(newPrice-order.Price) / order.Price * 100
+			// Calculate dynamic threshold based on trader's impact
+			dynamicThreshold := math.Abs(trader.ImpactAvg * mm.config.PriceUpdateDiff)
+			if dynamicThreshold < 0.01 {
+				dynamicThreshold = 0.01 // Minimum 0.01%
+			}
+
+			if priceChangePct > dynamicThreshold {
+				log.Printf("update: modify %s %s %s %.6f -> %.6f (price diff %+.2f%%)", order.Type, order.Side, order.Pair, order.Price, newPrice, priceChangePct)
+				order.Price = newPrice
+				mod = true
+			}
+		}
+
+		// Add order to modification list only once if any changes are needed
+		if mod {
+			ordersToModify = append(ordersToModify, order)
+			// Updating an order loses queue priority; record fresh post time for side
+			trader.Lock()
+			switch order.Side {
+			case "buy":
+				trader.LastQuoteTimeBuy = time.Now()
+			case "sell":
+				trader.LastQuoteTimeSell = time.Now()
+			default:
+			}
+			trader.Unlock()
+		}
+	}
+
+	// Check for profitable positions to close with market orders
+	placeOrders := make([]exchange.Order, 0, len(positions))
+	if mm.config.TakeProfitPct > 0 || mm.config.StopLossPct > 0 {
+
+		for pair, pos := range positions {
+			if pos.Size == 0 {
+				continue
+			}
+
+			trader, exists := mm.traders[pair]
+			if !exists {
+				continue
+			}
+
+			// Use Mark Price for PnL calculations to match Hyperliquid's implementation
+			// Hyperliquid uses Mark Price for all PnL calculations, not Index Price
+			trader.RLock()
+			price := trader.MarkPrice
+			trader.RUnlock()
+
+			// Get pair data for leverage calculation
+			pairData, _ := mm.Exchange.Pair(pair)
+
+			add := false
+			var side string
+			var size float64
+
+			if pos.Size > 0 { // Long position
+				side = "sell"
+				size = math.Abs(pos.Size)
+			} else { // Short position
+				side = "buy"
+				size = math.Abs(pos.Size)
+			}
+
+			if pos.Size > 0 { // Long position
+				// Use the Position's built-in percentage calculation
+				profitPct := pos.CalculatePNLPercentage(pairData)
+
+				// Check take profit
+				if mm.config.TakeProfitPct > 0 && profitPct >= mm.config.TakeProfitPct {
+					add = true
+					profitLossUsd := (price - pos.AvgPrice) * math.Abs(pos.Size)
+					log.Printf("update: take profit %s %s %.6f @ %.6f - PnL $%+.2f (%+.2f%%)", pair, side, size, pos.AvgPrice, profitLossUsd, profitPct)
+				}
+
+				// Check stop loss
+				if !add && mm.config.StopLossPct > 0 && profitPct <= -mm.config.StopLossPct {
+					add = true
+					profitLossUsd := (price - pos.AvgPrice) * math.Abs(pos.Size)
+					log.Printf("update: stop loss %s %s %.6f @ %.6f - PnL $%+.2f (%+.2f%%)", pair, side, size, pos.AvgPrice, profitLossUsd, -profitPct)
+				}
+
+				// Check trailing stop
+				if !add && mm.config.TrailingStartPct > 0 && mm.config.TrailingStopPct > 0 && profitPct >= mm.config.TrailingStartPct {
+					if trader._trailStopBuy == 0 || price > trader._trailStopBuy {
+						trader._trailStopBuy = price
+					}
+
+					// Check if price has dropped below trailing stop threshold
+					if trader._trailStopBuy > 0 {
+						trailingStopPrice := trader._trailStopBuy * (1 - mm.config.TrailingStopPct/100)
+						if price <= trailingStopPrice {
+							add = true
+							log.Printf("update: trailing stop %s %s %.6f @ %.6f (price %.6f <= stop %.6f)", pair, side, size, pos.AvgPrice, price, trailingStopPrice)
+							trader._trailStopBuy = 0
+						}
+					}
+				}
+			} else { // Short position
+				// Use the Position's built-in percentage calculation
+				profitPct := pos.CalculatePNLPercentage(pairData)
+
+				// Check take profit
+				if mm.config.TakeProfitPct > 0 && profitPct >= mm.config.TakeProfitPct {
+					add = true
+					profitLossUsd := (pos.AvgPrice - price) * math.Abs(pos.Size)
+					log.Printf("update: take profit %s %s %.6f @ %.6f - PnL $%+.2f (%+.2f%%)", pair, side, size, pos.AvgPrice, profitLossUsd, profitPct)
+				}
+
+				// Check stop loss
+				if !add && mm.config.StopLossPct > 0 && profitPct <= -mm.config.StopLossPct {
+					add = true
+					profitLossUsd := (pos.AvgPrice - price) * math.Abs(pos.Size)
+					log.Printf("update: stop loss %s %s %.6f @ %.6f - PnL $%+.2f (%+.2f%%)", pair, side, size, pos.AvgPrice, profitLossUsd, -profitPct)
+				}
+
+				// Check trailing stop
+				if !add && mm.config.TrailingStartPct > 0 && mm.config.TrailingStopPct > 0 && profitPct >= mm.config.TrailingStartPct {
+					if trader._trailStopSell == 0 || price < trader._trailStopSell {
+						trader._trailStopSell = price
+					}
+
+					// Check if price has risen above trailing stop threshold
+					if trader._trailStopSell > 0 {
+						trailingStopPrice := trader._trailStopSell * (1 + mm.config.TrailingStopPct/100)
+						if price >= trailingStopPrice {
+							add = true
+							log.Printf("update: trailing stop %s %s %.6f @ %.6f (price %.6f >= stop %.6f)", pair, side, size, pos.AvgPrice, price, trailingStopPrice)
+							trader._trailStopSell = 0
+						}
+					}
+				}
+			}
+
+			// Add order
+			if add {
+				placeOrders = append(placeOrders, exchange.Order{
+					Pair:       pair,
+					Side:       side,
+					Type:       "market",
+					Size:       size,
+					Price:      0,
+					ReduceOnly: true,
+				})
+			}
+		}
+	}
+
+	var didPlace, didCancel, didModify bool
+
+	if len(placeOrders) > 0 {
+		if err := mm.Exchange.PlaceOrders(placeOrders); err != nil {
+			log.Printf("Failed to place market close orders: %v", err)
+		} else {
+			didPlace = true
+		}
+	}
+
+	if len(ordersToCancel) > 0 {
+		if err := mm.Exchange.CancelOrders(ordersToCancel); err != nil {
+			log.Printf("Failed to cancel orders: %v", err)
+		} else {
+			didCancel = true
+		}
+	}
+
+	if len(ordersToModify) > 0 {
+		if err := mm.Exchange.ModifyOrders(ordersToModify); err != nil {
+			log.Printf("Failed to modify orders: %v", err)
+		} else {
+			didModify = true
+		}
+	}
+
+	return didPlace || didCancel || didModify
+}

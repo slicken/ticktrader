@@ -1,0 +1,26 @@
+{
+    "enable_dynamic_config": false,
+    "exchanges": [
+    {
+        "name": "hyperliquid",
+        "enabled": false,
+        "testnet": false,
+        "api_key": "0x...",
+        "api_secret": "0x...",
+        "debug": false
+    },
+    {
+        "name": "lighter",
+        "enabled": true,
+        "testnet": false,
+        "api_key": "123abc...",
+        "api_secret": "123abc...",
+        "api_key_index": 4,
+        "debug": false
+    }
+    ],
+    "model": {
+        "pairs": ["BTC", "ETH"],
+        "pairs_disabled": []
+    }
+}

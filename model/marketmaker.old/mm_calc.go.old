@@ -1,0 +1,179 @@
+package model
+
+import (
+	"marketmaker/exchange"
+	"math"
+	"time"
+)
+
+// getIndexPrice computes the fair price for quoting
+// - Uses midPrice normally
+// - Blends toward markPrice if deviation is large
+func getIndexPrice(midPrice, markPrice, maxDeviationPct float64) float64 {
+	if markPrice == 0 {
+		return midPrice
+	}
+
+	devFrac := maxDeviationPct / 100.0
+	deviation := (midPrice - markPrice) / markPrice
+
+	if math.Abs(deviation) <= devFrac/2 {
+		return midPrice
+	} else if math.Abs(deviation) >= devFrac {
+		return markPrice
+	}
+
+	frac := (math.Abs(deviation) - devFrac/2) / (devFrac / 2)
+	alpha := 1 - frac
+	return alpha*midPrice + (1-alpha)*markPrice
+}
+
+// calculateOptimalPrice returns the mid price skewed by inventorySkew and average spread percentage.
+func calculateOptimalPrice(indexPrice, spreadPct, inventorySkew float64) float64 {
+	// Convert spread percent to absolute spread in dollars
+	spreadAbs := indexPrice * (spreadPct / 100.0)
+
+	// Skew the mid price based on inventory
+	return indexPrice - (inventorySkew * spreadAbs / 2.0)
+}
+
+// calculateOptimalSpread computes the spread and bid/ask quotes in absolute terms.
+// All percent values are passed in percent form (e.g., 0.14 = 0.14%)
+// Sprad is calculated for directional trading quoting one side (where we get payed in funding)
+func calculateOptimalSpread(
+	indexPrice float64,
+	makerFeePct, takerFeePct, fundingRatePct, minProfitPct float64,
+	impactPct, volatilityPct, latencyBufferPct float64,
+) (spreadPct, minSpreadAbs, bidPrice, askPrice float64) {
+
+	// Convert percent inputs to decimals
+	makerFee := makerFeePct / 100
+	takerFee := takerFeePct / 100
+	minProfit := minProfitPct / 100
+	funding := fundingRatePct / 100
+	impact := impactPct / 100
+	volatility := volatilityPct / 100
+	latency := latencyBufferPct / 100
+
+	// Minimum spread required to be profitable
+	baseDistancePct := makerFee + takerFee + minProfit - math.Abs(funding)
+	minDistanceAbs := indexPrice * baseDistancePct
+
+	// Buffert for volatility and latency
+	// Use the larger of impact or volatility to ensure we're not too aggressive
+	buffertPct := latency + math.Max(math.Abs(impact), volatility)
+	buffertPct = math.Min(buffertPct, 0.02) // cap at 2%
+	bufferAbs := indexPrice * buffertPct
+
+	bidPrice = indexPrice - (minDistanceAbs / 2) - (bufferAbs / 2)
+	askPrice = indexPrice + (minDistanceAbs / 2) + (bufferAbs / 2)
+
+	spreadPct = (askPrice - bidPrice) / indexPrice * 100
+	minSpreadAbs = minDistanceAbs * 2
+
+	return
+}
+
+// calculateLatencyBufferPct
+func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
+	const MIN_BUFFER = 0.01
+	latencySeconds := float64(latencyMs) / 2 / 1000.0
+	// Fixed component: minimum buffer for any latency
+	fixedBuffer := math.Max(latencySeconds*0.1, MIN_BUFFER)
+	// Adaptive component: based on base spread
+	adaptiveBuffer := spreadPct * latencySeconds * 0.5
+	return math.Max(fixedBuffer+adaptiveBuffer, MIN_BUFFER)
+}
+
+func EMA(newValue, oldValue, alpha float64) float64 {
+	return alpha*newValue + (1-alpha)*oldValue
+}
+
+// calculateVolatilityPct calculates volatility percentage based on log returns over a specified number of trades
+func (t *trader) calculateVolatilityPct(length int) float64 {
+	numTrades := len(t.Trades)
+	if numTrades < 2 {
+		return 0.0
+	}
+
+	if length > numTrades {
+		length = numTrades
+	}
+
+	sum, sumSq := 0.0, 0.0
+	count := 0
+
+	// Forward loop from latest (index 0) to older trades
+	// i starts at 1, so pNewer = Trades[i-1], pOlder = Trades[i]
+	for i := 1; i < length; i++ {
+		pNewer := t.Trades[i-1].Order.Price
+		pOlder := t.Trades[i].Order.Price
+
+		if pNewer > 0 && pOlder > 0 {
+			logRet := math.Log(pNewer / pOlder)
+			sum += logRet
+			sumSq += logRet * logRet
+			count++
+		}
+	}
+
+	if count < 2 {
+		return 0.0
+	}
+
+	mean := sum / float64(count)
+	variance := (sumSq - float64(count)*mean*mean) / float64(count-1)
+	if variance < 0 {
+		variance = 0
+	}
+
+	return math.Sqrt(variance) * 100
+}
+
+// calculateTradesInDuration calculates the number of trades within a specified time duration
+func (t *trader) calculateTradesInDuration(duration time.Duration) int {
+	numTrades := len(t.Trades)
+	if numTrades == 0 {
+		return 0
+	}
+
+	// Use the most recent trade's timestamp as reference point instead of system time
+	// This ensures consistency regardless of system clock differences
+	mostRecentTime := t.Trades[0].Order.Time
+	cutoffTime := mostRecentTime.Add(-duration)
+	count := 0
+
+	for _, trade := range t.Trades {
+		if !trade.Order.Time.Before(cutoffTime) {
+			count++
+		}
+	}
+
+	return count
+}
+
+// calculateWeightedPrice calculates weighted average price for closing position
+func calculateWeightedPrice(levels []exchange.Price, size float64) (float64, bool) {
+	if len(levels) == 0 || size <= 0 {
+		return 0, false
+	}
+
+	var totalValue, totalSize float64
+	remaining := math.Abs(size)
+
+	for _, level := range levels {
+		if remaining <= 0 {
+			break
+		}
+		tradeSize := math.Min(level.Size, remaining)
+		totalValue += level.Price * tradeSize
+		totalSize += tradeSize
+		remaining -= tradeSize
+	}
+
+	if remaining > 0 {
+		return 0, false // Not enough liquidity
+	}
+
+	return totalValue / totalSize, true
+}
