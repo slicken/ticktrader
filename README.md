@@ -75,6 +75,8 @@ Add your adapter in `loadExchange`:
 - map config name -> constructor
 - return your `exchange.I` implementation
 
+![dashboard screenshot](screenshot.png?raw=true "dashboard")
+
 ## License
 
-See `LICENSE`.
+MIT License - see [LICENSE](LICENSE) file for details.

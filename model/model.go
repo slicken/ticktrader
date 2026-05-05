@@ -13,10 +13,9 @@ import (
 )
 
 const (
-	BARS_LENGTH   = 210
-	TRADES_LENGTH = 5000
-	ARRAY_LENGTH  = 200
-	BAR_INTERVAL  = "1m"
+	ARRAY_SIZE      = 200
+	ORDERBOOK_LEVEL = 10
+	BAR_INTERVAL    = "1m"
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -44,12 +43,13 @@ type trader struct {
 	bestAsk        float64
 	asksVol        float64
 	bidsVol        float64
+	volumePct      float64
 	tradePerMinute int
 	lastTradePrice float64
 	openInterest   float64
 	fundingRate    float64
-	SMA20          float64
-	SMA20SlopePct  float64
+	m1_SMA         float64
+	m1_SMASlope    float64
 	sync.RWMutex
 }
 
@@ -117,7 +117,7 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 			if err := exch.SubscribePair(p); err != nil {
 				log.Printf("Error subscribing to pair %s: %v", p, err)
 			} else {
-				log.Printf("Subscribed to pair %s", p)
+				log.Printf("Subscribed %s to pair", p)
 				mu.Lock()
 				count++
 				mu.Unlock()
@@ -125,7 +125,7 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 			if err := exch.SubscribeTrades(p); err != nil {
 				log.Printf("Error subscribing to trades %s: %v", p, err)
 			} else {
-				log.Printf("Subscribed to trades %s", p)
+				log.Printf("Subscribed %s to trades", p)
 				mu.Lock()
 				count++
 				mu.Unlock()
@@ -133,7 +133,7 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 			if err := exch.SubscribeBars(p, BAR_INTERVAL); err != nil {
 				log.Printf("Error subscribing to %s bars %s: %v", p, BAR_INTERVAL, err)
 			} else {
-				log.Printf("Subscribed to %s bars %s", p, BAR_INTERVAL)
+				log.Printf("Subscribed %s to bars %s", p, BAR_INTERVAL)
 				mu.Lock()
 				count++
 				mu.Unlock()
@@ -141,7 +141,15 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 			if err := exch.SubscribePrices(p); err != nil {
 				log.Printf("Error subscribing to prices %s: %v", p, err)
 			} else {
-				log.Printf("Subscribed to prices %s", p)
+				log.Printf("Subscribed %s to prices", p)
+				mu.Lock()
+				count++
+				mu.Unlock()
+			}
+			if err := exch.SubscribeOrderbook(p); err != nil {
+				log.Printf("Error subscribing to orderbook %s: %v", p, err)
+			} else {
+				log.Printf("Subscribed %s to orderbook", p)
 				mu.Lock()
 				count++
 				mu.Unlock()
@@ -149,14 +157,6 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 			if err := strat.getInitialBars(p); err != nil {
 				log.Printf("Error loading initial %s bars %s: %v", p, BAR_INTERVAL, err)
 			}
-			// if err := exch.SubscribeOrderbook(p); err != nil {
-			// 	log.Printf("Error subscribing to orderbook %s: %v", p, err)
-			// } else {
-			// 	log.Printf("Subscribed to orderbook %s", p)
-			// 	mu.Lock()
-			// 	count++
-			// 	mu.Unlock()
-			// }
 		}(pair)
 	}
 	wg.Wait()
@@ -172,12 +172,12 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 	return &trader{
 		parent:         parent,
 		Pair:           pair,
-		Bars:           make([]exchange.Bar, 0, BARS_LENGTH),
-		Trades:         make([]exchange.Trade, 0, TRADES_LENGTH),
-		Prices:         make([][2]exchange.Price, 0, ARRAY_LENGTH),
-		slippagePct:    make([]float64, 0, ARRAY_LENGTH),
+		Bars:           make([]exchange.Bar, 0, ARRAY_SIZE),
+		Trades:         make([]exchange.Trade, 0, ARRAY_SIZE),
+		Prices:         make([][2]exchange.Price, 0, ARRAY_SIZE),
+		slippagePct:    make([]float64, 0, ARRAY_SIZE),
 		slippageAvg:    0,
-		spreadPct:      make([]float64, 0, ARRAY_LENGTH),
+		spreadPct:      make([]float64, 0, ARRAY_SIZE),
 		spreadAvg:      0,
 		MarkPrice:      0,
 		Price:          0,
@@ -185,12 +185,13 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		bestAsk:        0,
 		asksVol:        0,
 		bidsVol:        0,
+		volumePct:      0,
 		tradePerMinute: 0,
 		lastTradePrice: 0,
 		openInterest:   0,
 		fundingRate:    0,
-		SMA20:          0,
-		SMA20SlopePct:  0,
+		m1_SMA:         0,
+		m1_SMASlope:    0,
 	}
 }
 
@@ -309,7 +310,7 @@ func (strat *Marketmaker) update() {
 }
 
 func (strat *Marketmaker) getInitialBars(pair string) error {
-	bars, err := strat.Exchange.GetBars(pair, BAR_INTERVAL, BARS_LENGTH)
+	bars, err := strat.Exchange.GetBars(pair, BAR_INTERVAL, ARRAY_SIZE)
 	if err != nil {
 		return err
 	}
@@ -324,10 +325,10 @@ func (strat *Marketmaker) getInitialBars(pair string) error {
 
 	t.Bars = t.Bars[:0]
 	for _, bar := range bars {
-		insertWithLimitInPlace(&t.Bars, bar, BARS_LENGTH)
+		insertWithLimitInPlace(&t.Bars, bar, ARRAY_SIZE)
 	}
 	if sma := calculateSMA(t.Bars, 20); sma > 0 {
-		t.SMA20 = sma
+		t.m1_SMA = sma
 	}
 
 	return nil
@@ -356,10 +357,20 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	askPrice := (*prices)[1]
 	bid := bidPrice.Price
 	ask := askPrice.Price
-	bidSize := bidPrice.Size
-	askSize := askPrice.Size
 	if bid <= 0 || ask <= 0 || ask < bid {
 		return
+	}
+
+	bidSize := bidPrice.Size
+	askSize := askPrice.Size
+
+	asksVol, bidsVol, volPct := t.calculateOBVolPct(ORDERBOOK_LEVEL)
+	if asksVol == 0 && bidsVol == 0 {
+		// Fallback when orderbook is unavailable: approximate volumes
+		// from top-of-book price tick sizes.
+		asksVol = askSize * ask
+		bidsVol = bidSize * bid
+		volPct = ((bidsVol - asksVol) / (bidsVol + asksVol)) * 100
 	}
 
 	t.Lock()
@@ -367,8 +378,9 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 
 	t.bestBid = bid
 	t.bestAsk = ask
-	t.bidsVol = bidSize
-	t.asksVol = askSize
+	t.asksVol = asksVol
+	t.bidsVol = bidsVol
+	t.volumePct = volPct
 	mid := (bid + ask) / 2
 	spreadPct := ((ask - bid) / mid) * 100
 	priceTime := bidPrice.Time
@@ -380,9 +392,42 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	}
 	bidPrice.Time = priceTime
 	askPrice.Time = priceTime
-	insertWithLimitInPlace(&t.Prices, [2]exchange.Price{bidPrice, askPrice}, ARRAY_LENGTH)
-	insertWithLimitInPlace(&t.spreadPct, spreadPct, ARRAY_LENGTH)
+	insertWithLimitInPlace(&t.Prices, [2]exchange.Price{bidPrice, askPrice}, ARRAY_SIZE)
+	insertWithLimitInPlace(&t.spreadPct, spreadPct, ARRAY_SIZE)
 	t.updateSpreadAvg()
+}
+
+// calculateOBVolPct sums top-N bid/ask sizes from the subscribed orderbook,
+// then returns notional-ish volumes (depth × top-of-book price) and imbalance
+// in percent: positive means more bid size, negative more ask size.
+func (t *trader) calculateOBVolPct(levels int) (float64, float64, float64) {
+	if t.parent == nil || t.parent.Exchange == nil || levels <= 0 {
+		return 0, 0, 0
+	}
+	ob, err := t.parent.Exchange.GetOrderbook(t.Pair)
+	if err != nil {
+		return 0, 0, 0
+	}
+	if len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+		return 0, 0, 0
+	}
+
+	var bidDepth, askDepth float64
+	for i := 0; i < levels && i < len(ob.Bids); i++ {
+		bidDepth += ob.Bids[i].Size
+	}
+	for i := 0; i < levels && i < len(ob.Asks); i++ {
+		askDepth += ob.Asks[i].Size
+	}
+	totalDepth := bidDepth + askDepth
+	if totalDepth == 0 {
+		return 0, 0, 0
+	}
+
+	asksVol := askDepth * ob.Asks[0].Price
+	bidsVol := bidDepth * ob.Bids[0].Price
+	imbalance := (bidDepth - askDepth) / totalDepth
+	return asksVol, bidsVol, imbalance * 100.0
 }
 
 func (t *trader) updateTrade(trade *exchange.Trade) {
@@ -415,9 +460,13 @@ func (t *trader) updateTrade(trade *exchange.Trade) {
 		t.lastTradePrice = tradedPrice
 	}
 
-	insertWithLimitInPlace(&t.Trades, *trade, TRADES_LENGTH)
+	insertWithLimitInPlace(&t.Trades, *trade, ARRAY_SIZE)
 	t.tradePerMinute = t.calculateTradesInDuration(time.Minute)
-	t.calculateSlippage(trade)
+	side := ""
+	if trade.Order != nil {
+		side = trade.Order.Side
+	}
+	t.calculateSlippage(trade.Fills, side)
 }
 
 // calculateTradesInDuration calculates the number of stored trades inside duration.
@@ -428,10 +477,13 @@ func (t *trader) calculateTradesInDuration(duration time.Duration) int {
 	}
 
 	var mostRecentTime time.Time
+	var oldestTime time.Time
 	for _, trade := range t.Trades {
 		if trade.Order != nil && !trade.Order.Time.IsZero() {
-			mostRecentTime = trade.Order.Time
-			break
+			if mostRecentTime.IsZero() {
+				mostRecentTime = trade.Order.Time
+			}
+			oldestTime = trade.Order.Time
 		}
 	}
 	if mostRecentTime.IsZero() {
@@ -445,6 +497,16 @@ func (t *trader) calculateTradesInDuration(duration time.Duration) int {
 			count++
 		}
 	}
+
+	// If the bounded trade buffer doesn't span the full duration, estimate
+	// per-minute rate from the observed trade span to avoid undercounting.
+	if len(t.Trades) == cap(t.Trades) && !oldestTime.IsZero() && oldestTime.After(cutoffTime) {
+		spanSeconds := mostRecentTime.Sub(oldestTime).Seconds()
+		if spanSeconds > 0 {
+			return int(math.Round(float64(len(t.Trades)) * duration.Seconds() / spanSeconds))
+		}
+	}
+
 	return count
 }
 
@@ -456,61 +518,62 @@ func (t *trader) updateBar(bar *exchange.Bar) {
 	t.Lock()
 	defer t.Unlock()
 
-	previousSMA := t.SMA20
+	previousSMA := t.m1_SMA
 	t.updateBars(*bar)
 
 	if sma := calculateSMA(t.Bars, 20); sma > 0 {
-		t.SMA20 = sma
+		t.m1_SMA = sma
 		if previousSMA > 0 {
-			t.SMA20SlopePct = ((sma - previousSMA) / previousSMA) * 100
+			t.m1_SMASlope = ((sma - previousSMA) / previousSMA) * 100
 		}
 	}
 }
 
-// calculateSlippage records price impact versus mark price.
+// calculateSlippage records price impact versus mark price based on trade fills.
 // The caller must hold t.Lock.
-func (t *trader) calculateSlippage(trade *exchange.Trade) {
-	if trade == nil || len(trade.Fills) == 0 || t.MarkPrice <= 0 {
+func (t *trader) calculateSlippage(fills []*exchange.Fill, side string) {
+	if len(fills) == 0 || t.MarkPrice <= 0 {
 		return
 	}
 
-	side := ""
-	if trade.Order != nil {
-		side = strings.ToLower(trade.Order.Side)
-	}
-
-	var slippagePct float64
-	for _, fill := range trade.Fills {
-		if fill == nil || fill.Price <= 0 || fill.Size <= 0 {
-			continue
-		}
-		if side == "" {
-			side = strings.ToLower(fill.Side)
-		}
-
-		// Track worst impacted fill versus mark price.
-		switch side {
-		case "buy":
-			impact := ((fill.Price - t.MarkPrice) / t.MarkPrice) * 100
-			if impact > slippagePct {
-				slippagePct = impact
-			}
-		case "sell":
-			impact := -((t.MarkPrice - fill.Price) / t.MarkPrice) * 100
-			if impact < slippagePct {
-				slippagePct = impact
-			}
-		}
-	}
-
+	side = strings.ToLower(side)
 	if side != "buy" && side != "sell" {
 		return
 	}
+
+	var worstFillPrice float64
+	for _, fill := range fills {
+		if fill == nil || fill.Price <= 0 || fill.Size <= 0 {
+			continue
+		}
+		switch side {
+		case "buy":
+			if fill.Price > worstFillPrice {
+				worstFillPrice = fill.Price
+			}
+		case "sell":
+			if worstFillPrice == 0 || fill.Price < worstFillPrice {
+				worstFillPrice = fill.Price
+			}
+		}
+	}
+
+	if worstFillPrice <= 0 {
+		return
+	}
+
+	var slippagePct float64
+	if side == "buy" {
+		slippagePct = ((worstFillPrice - t.MarkPrice) / t.MarkPrice) * 100
+	} else {
+		slippagePct = -((t.MarkPrice - worstFillPrice) / t.MarkPrice) * 100
+	}
+
 	if math.Abs(slippagePct) < 0.01 {
 		return
 	}
 
-	insertWithLimitInPlace(&t.slippagePct, slippagePct, ARRAY_LENGTH)
+	insertWithLimitInPlace(&t.slippagePct, slippagePct, ARRAY_SIZE)
 	t.updateSlippageAvg()
 }
 
@@ -522,8 +585,8 @@ func (t *trader) updateSlippageAvg() {
 		t.slippageAvg = 0
 		return
 	}
-	if n > ARRAY_LENGTH {
-		n = ARRAY_LENGTH
+	if n > ARRAY_SIZE {
+		n = ARRAY_SIZE
 	}
 
 	var weightedSum float64
@@ -555,13 +618,6 @@ func (t *trader) updateSpreadAvg() {
 	t.spreadAvg = sum / float64(len(t.spreadPct))
 }
 
-func latestFloat(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	return values[0]
-}
-
 func (t *trader) updateBars(bar exchange.Bar) {
 	if len(t.Bars) > 0 && t.Bars[0].Time.Equal(bar.Time) {
 		t.Bars[0] = bar
@@ -571,7 +627,7 @@ func (t *trader) updateBars(bar exchange.Bar) {
 		return
 	}
 
-	insertWithLimitInPlace(&t.Bars, bar, BARS_LENGTH)
+	insertWithLimitInPlace(&t.Bars, bar, ARRAY_SIZE)
 }
 
 func calculateSMA(bars []exchange.Bar, length int) float64 {

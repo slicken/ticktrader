@@ -29,9 +29,9 @@ type dashboardHistory struct {
 	// PairedQuotes keeps each bid with the ask from the same exchange update.
 	// Merging bids and asks in separate slices breaks index alignment and makes charts look spiky.
 	PairedQuotes [][2]exchange.Price
-	MarkPrices   []exchange.Price
-	SMA20Prices  []exchange.Price
-	Trades       []exchange.Price
+	MarkPrices  []exchange.Price
+	M1SMAPrices []exchange.Price
+	Trades      []exchange.Price
 }
 
 type DashboardData struct {
@@ -57,12 +57,14 @@ type DashboardPairData struct {
 	TradesPerMinute int              `json:"trades_per_minute"`
 	OpenInterest    float64          `json:"open_interest"`
 	FundingRate     float64          `json:"funding_rate"`
-	SMA20           float64          `json:"sma20"`
-	SMA20SlopePct   float64          `json:"sma20_slope_pct"`
+	M1_SMA          float64          `json:"m1_sma"`
+	M1_SMASlope     float64          `json:"m1_sma_slope"`
 	BidPrices       []exchange.Price `json:"bid_prices"`
 	AskPrices       []exchange.Price `json:"ask_prices"`
 	MarkPrices      []exchange.Price `json:"mark_prices"`
-	SMA20Prices     []exchange.Price `json:"sma20_prices"`
+	M1SMAPrices     []exchange.Price `json:"m1_sma_prices"`
+	OBBidLevels     []exchange.Price `json:"ob_bid_levels"`
+	OBAskLevels     []exchange.Price `json:"ob_ask_levels"`
 	Trades          []exchange.Price `json:"trades"`
 }
 
@@ -208,6 +210,37 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			pointer-events: none;
 			white-space: nowrap;
 		}
+		.depth-overlay {
+			position: absolute;
+			top: 0;
+			right: 18px;
+			bottom: 0;
+			width: 44%;
+			pointer-events: none;
+			z-index: 1;
+		}
+		.depth-midline {
+			position: absolute;
+			top: 0;
+			bottom: 0;
+			right: 14px;
+			width: 1px;
+			background: rgba(156, 163, 175, 0.35);
+		}
+		.depth-level {
+			position: absolute;
+			right: 14px;
+			height: 20px;
+			min-height: 20px;
+			opacity: 0.3;
+			border-radius: 2px;
+		}
+		.depth-bid {
+			background: rgba(74, 222, 128, 0.3);
+		}
+		.depth-ask {
+			background: rgba(248, 113, 113, 0.3);
+		}
 		.positive { color: #4ade80; }
 		.negative { color: #f87171; }
 		.neutral { color: #d1d5db; }
@@ -278,10 +311,10 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						pointHoverRadius: 0,
 						tension: 0,
 					}, {
-						label: 'SMA20',
+						label: 'm1_SMA',
 						data: [],
-						borderColor: '#60a5fa',
-						backgroundColor: 'rgba(96, 165, 250, 0.10)',
+						borderColor: '#1d4ed8',
+						backgroundColor: 'rgba(29, 78, 216, 0.10)',
 						borderWidth: 1.4,
 						pointRadius: 0,
 						pointHoverRadius: 0,
@@ -364,24 +397,24 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			return series.filter(point => new Date(point.Time).getTime() >= cutoffMs);
 		}
 
-		function trimRollingChartWindow(bids, asks, marks, sma20s, trades) {
+		function trimRollingChartWindow(bids, asks, marks, m1smas, trades) {
 			const windowMs = chartWindowSeconds * 1000;
 			const endMs = Math.max(
 				maxTimeMs(bids),
 				maxTimeMs(asks),
 				maxTimeMs(marks),
-				maxTimeMs(sma20s),
+				maxTimeMs(m1smas),
 				maxTimeMs(trades),
 			);
 			if (!Number.isFinite(endMs) || endMs <= 0) {
-				return { bids, asks, marks, sma20s, trades };
+				return { bids, asks, marks, m1smas, trades };
 			}
 
 			const cutoffMs = endMs - windowMs;
 			let nextBids = trimPricesByWindow(bids, cutoffMs);
 			let nextAsks = trimPricesByWindow(asks, cutoffMs);
 			const nextMarks = trimPricesByWindow(marks, cutoffMs);
-			const nextSma20s = trimPricesByWindow(sma20s, cutoffMs);
+			const nextM1Smas = trimPricesByWindow(m1smas, cutoffMs);
 			const nextTrades = trimPricesByWindow(trades, cutoffMs);
 
 			const pairCount = Math.min(nextBids.length, nextAsks.length);
@@ -392,7 +425,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				bids: nextBids,
 				asks: nextAsks,
 				marks: nextMarks,
-				sma20s: nextSma20s,
+				m1smas: nextM1Smas,
 				trades: nextTrades,
 			};
 		}
@@ -432,8 +465,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
 				metric('Open Interest', fmt(row.open_interest, 2)) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
-				metric('SMA20', fmt(row.sma20)) +
-				metric('SMA20 Slope', pct(row.sma20_slope_pct), cls(row.sma20_slope_pct)) +
+				metric('m1_SMA', fmt(row.m1_sma)) +
+				metric('m1_SMA Slope', pct(row.m1_sma_slope), cls(row.m1_sma_slope)) +
 			'</div>';
 		}
 
@@ -458,6 +491,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 					'<div class="chart-panel">' +
 						'<div class="chart-wrap">' +
 							'<div class="chart-points" id="chart-points-' + i + '">0 points</div>' +
+							'<div class="depth-overlay" id="depth-' + i + '"><div class="depth-midline"></div></div>' +
 							'<canvas id="chart-' + i + '"></canvas>' +
 						'</div>' +
 					'</div>' +
@@ -482,13 +516,13 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			let bids = (row.bid_prices || []).slice().reverse();
 			let asks = (row.ask_prices || []).slice().reverse();
 			let marks = (row.mark_prices || []).slice().reverse();
-			let sma20s = (row.sma20_prices || []).slice().reverse();
+			let m1smas = (row.m1_sma_prices || []).slice().reverse();
 			let trades = (row.trades || []).slice().reverse();
-			const trimmed = trimRollingChartWindow(bids, asks, marks, sma20s, trades);
+			const trimmed = trimRollingChartWindow(bids, asks, marks, m1smas, trades);
 			bids = trimmed.bids;
 			asks = trimmed.asks;
 			marks = trimmed.marks;
-			sma20s = trimmed.sma20s;
+			m1smas = trimmed.m1smas;
 			trades = trimmed.trades;
 			if (points) points.textContent = bids.length + ' points / ' + chartWindowLabel();
 
@@ -501,8 +535,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[1].label = 'ask';
 			chart.data.datasets[2].data = alignSeriesToPrices(bids, marks);
 			chart.data.datasets[2].label = 'mark';
-			chart.data.datasets[3].data = alignSeriesToPrices(bids, sma20s);
-			chart.data.datasets[3].label = 'SMA20';
+			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1smas);
+			chart.data.datasets[3].label = 'm1_SMA';
 			const tradeAlign = alignTradesToPrices(bids, trades);
 			chart.data.datasets[4].data = tradeAlign.prices;
 			chart.data.datasets[4].tradeSizes = tradeAlign.sizes;
@@ -510,13 +544,15 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[4].pointRadius = tradeRadii;
 			chart.data.datasets[4].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
 			chart.data.datasets[4].label = 'trades';
-			setPriceScale(chart, bids, asks, marks);
+			setPriceScale(chart, bids, asks, marks, tradeAlign.prices);
 			chart.update('none');
+			renderOrderbookDepth(i, chart, row.ob_bid_levels || [], row.ob_ask_levels || []);
 		}
 
-		function setPriceScale(chart, bids, asks, marks) {
+		function setPriceScale(chart, bids, asks, marks, tradePrices) {
 			const prices = bids.concat(asks, marks)
 				.map(price => price.Price)
+				.concat((tradePrices || []).filter(price => Number.isFinite(price)))
 				.filter(price => price > 0);
 
 			if (prices.length === 0) {
@@ -530,6 +566,74 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			const padding = Math.max((max - min) * 0.08, max * 0.0001);
 			chart.options.scales.y.min = min - padding;
 			chart.options.scales.y.max = max + padding;
+		}
+
+		function renderOrderbookDepth(index, chart, bidLevels, askLevels) {
+			const overlay = document.getElementById('depth-' + index);
+			if (!overlay || !chart || !chart.scales || !chart.scales.y) {
+				return;
+			}
+			overlay.innerHTML = '<div class="depth-midline"></div>';
+
+			const chartArea = chart.chartArea;
+			if (!chartArea) {
+				return;
+			}
+			const yScale = chart.scales.y;
+			const depthLevels = 10;
+			const bidsTop = (bidLevels || []).slice(0, depthLevels);
+			const asksTop = (askLevels || []).slice(0, depthLevels);
+			let bidCum = 0;
+			const bidSteps = [];
+			for (const level of bidsTop) {
+				const notional = (level?.Price || 0) * (level?.Size || 0);
+				if (!(notional > 0) || !(level?.Price > 0)) {
+					continue;
+				}
+				bidCum += notional;
+				bidSteps.push({ price: level.Price, cum: bidCum });
+			}
+			let askCum = 0;
+			const askSteps = [];
+			for (const level of asksTop) {
+				const notional = (level?.Price || 0) * (level?.Size || 0);
+				if (!(notional > 0) || !(level?.Price > 0)) {
+					continue;
+				}
+				askCum += notional;
+				askSteps.push({ price: level.Price, cum: askCum });
+			}
+
+			const maxCum = Math.max(bidCum, askCum);
+			if (!(maxCum > 0)) {
+				return;
+			}
+
+			// Keep top levels visible even when some book prices fall outside chart y-range.
+			// We anchor at best bid/ask y and compress remaining levels within available space.
+			const bestBidYRaw = bidSteps.length > 0 ? yScale.getPixelForValue(bidSteps[0].price) : chartArea.bottom;
+			const bestAskYRaw = askSteps.length > 0 ? yScale.getPixelForValue(askSteps[0].price) : chartArea.top;
+			const bestBidY = Math.min(chartArea.bottom, Math.max(chartArea.top, Number.isFinite(bestBidYRaw) ? bestBidYRaw : chartArea.bottom));
+			const bestAskY = Math.min(chartArea.bottom, Math.max(chartArea.top, Number.isFinite(bestAskYRaw) ? bestAskYRaw : chartArea.top));
+			const bidStepPx = bidSteps.length > 1 ? Math.max(4, (chartArea.bottom - bestBidY) / (bidSteps.length - 1)) : 0;
+			const askStepPx = askSteps.length > 1 ? Math.max(4, (bestAskY - chartArea.top) / (askSteps.length - 1)) : 0;
+
+			const draw = (steps, cls, startY, stepPx, direction) => {
+				for (let i = 0; i < steps.length; i++) {
+					const step = steps[i];
+					let y = startY + direction*stepPx*i;
+					y = Math.min(chartArea.bottom, Math.max(chartArea.top, y));
+					const widthPct = Math.max(4, Math.round((step.cum / maxCum) * 95));
+					const el = document.createElement('div');
+					el.className = 'depth-level ' + cls;
+					el.style.width = widthPct + '%';
+					el.style.top = Math.round(y - 10) + 'px';
+					overlay.appendChild(el);
+				}
+			};
+
+			draw(bidSteps, 'depth-bid', bestBidY, bidStepPx, 1);
+			draw(askSteps, 'depth-ask', bestAskY, askStepPx, -1);
 		}
 
 		function alignSeriesToPrices(prices, series) {
@@ -688,6 +792,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			continue
 		}
 
+		obBids, obAsks := dashboardOrderbookLevels(strat.Exchange, pair, 20)
+
 		t.RLock()
 		midPrice := t.Price
 		if t.bestBid > 0 && t.bestAsk > 0 {
@@ -707,12 +813,14 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			TradesPerMinute: t.tradePerMinute,
 			OpenInterest:    t.openInterest,
 			FundingRate:     t.fundingRate,
-			SMA20:           t.SMA20,
-			SMA20SlopePct:   t.SMA20SlopePct,
+			M1_SMA:          t.m1_SMA,
+			M1_SMASlope:     t.m1_SMASlope,
 			BidPrices:       bidPrices,
 			AskPrices:       askPrices,
 			MarkPrices:      dashboardPricePoint(t.MarkPrice, sampleTime),
-			SMA20Prices:     dashboardPricePoint(t.SMA20, sampleTime),
+			M1SMAPrices:     dashboardPricePoint(t.m1_SMA, sampleTime),
+			OBBidLevels:     obBids,
+			OBAskLevels:     obAsks,
 			Trades:          tradePricePoints(t.Trades),
 		}
 		t.RUnlock()
@@ -753,15 +861,43 @@ func (d *Dashboard) applyHistory(key string, row *DashboardPairData) {
 		cutoff,
 	)
 	history.MarkPrices = trimDashboardPrices(mergeLatestPrices(history.MarkPrices, row.MarkPrices), cutoff)
-	history.SMA20Prices = trimDashboardPrices(mergeLatestPrices(history.SMA20Prices, row.SMA20Prices), cutoff)
+	history.M1SMAPrices = trimDashboardPrices(mergeLatestPrices(history.M1SMAPrices, row.M1SMAPrices), cutoff)
 	history.Trades = trimDashboardPrices(mergeLatestPrices(history.Trades, row.Trades), cutoff)
 
 	bids, asks := splitBidAskPricePairs(history.PairedQuotes)
 	row.BidPrices = copyLatestPrices(bids)
 	row.AskPrices = copyLatestPrices(asks)
 	row.MarkPrices = copyLatestPrices(history.MarkPrices)
-	row.SMA20Prices = copyLatestPrices(history.SMA20Prices)
+	row.M1SMAPrices = copyLatestPrices(history.M1SMAPrices)
 	row.Trades = copyLatestPrices(history.Trades)
+}
+
+func dashboardOrderbookLevels(exch exchange.I, pair string, levels int) ([]exchange.Price, []exchange.Price) {
+	if exch == nil || levels <= 0 {
+		return nil, nil
+	}
+	ob, err := exch.GetOrderbook(pair)
+	if err != nil || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+		return nil, nil
+	}
+
+	bids := make([]exchange.Price, 0, levels)
+	for i := 0; i < levels && i < len(ob.Bids); i++ {
+		level := ob.Bids[i]
+		if level.Price <= 0 || level.Size <= 0 {
+			continue
+		}
+		bids = append(bids, level)
+	}
+	asks := make([]exchange.Price, 0, levels)
+	for i := 0; i < levels && i < len(ob.Asks); i++ {
+		level := ob.Asks[i]
+		if level.Price <= 0 || level.Size <= 0 {
+			continue
+		}
+		asks = append(asks, level)
+	}
+	return bids, asks
 }
 
 func rowKey(row DashboardPairData) string {
