@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"html/template"
 	"log"
+	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"trader-mux/exchange"
 )
 
 const (
-	DASHBOARD_CHART_WINDOW     = 30 * time.Second
-	DASHBOARD_REFRESH_INTERVAL = 1000 * time.Millisecond
+	DASHBOARD_CHART_WINDOW     = 20 * time.Second
+	DASHBOARD_REFRESH_INTERVAL = 100 * time.Millisecond
 )
 
 type Dashboard struct {
@@ -29,9 +31,9 @@ type dashboardHistory struct {
 	// PairedQuotes keeps each bid with the ask from the same exchange update.
 	// Merging bids and asks in separate slices breaks index alignment and makes charts look spiky.
 	PairedQuotes [][2]exchange.Price
-	MarkPrices  []exchange.Price
-	M1SMAPrices []exchange.Price
-	Trades      []exchange.Price
+	MarkPrices   []exchange.Price
+	M1SMAPrices  []exchange.Price
+	Trades       []dashboardTradePoint
 }
 
 type DashboardData struct {
@@ -47,25 +49,38 @@ type dashboardTemplateData struct {
 }
 
 type DashboardPairData struct {
-	Exchange        string           `json:"exchange"`
-	Symbol          string           `json:"symbol"`
-	MarkPrice       float64          `json:"mark_price"`
-	MidPrice        float64          `json:"mid_price"`
-	LastTradePrice  float64          `json:"last_trade_price"`
-	SpreadAvg       float64          `json:"spread_avg"`
-	SlippageAvg     float64          `json:"slippage_avg"`
-	TradesPerMinute int              `json:"trades_per_minute"`
-	OpenInterest    float64          `json:"open_interest"`
-	FundingRate     float64          `json:"funding_rate"`
-	M1_SMA          float64          `json:"m1_sma"`
-	M1_SMASlope     float64          `json:"m1_sma_slope"`
-	BidPrices       []exchange.Price `json:"bid_prices"`
-	AskPrices       []exchange.Price `json:"ask_prices"`
-	MarkPrices      []exchange.Price `json:"mark_prices"`
-	M1SMAPrices     []exchange.Price `json:"m1_sma_prices"`
-	OBBidLevels     []exchange.Price `json:"ob_bid_levels"`
-	OBAskLevels     []exchange.Price `json:"ob_ask_levels"`
-	Trades          []exchange.Price `json:"trades"`
+	Exchange         string                `json:"exchange"`
+	Symbol           string                `json:"symbol"`
+	PriceDecimals    int                   `json:"price_decimals"`
+	MarkPrice        float64               `json:"mark_price"`
+	MidPrice         float64               `json:"mid_price"`
+	LastTradePrice   float64               `json:"last_trade_price"`
+	SpreadAvg        float64               `json:"spread_avg"`
+	SlippageAvg      float64               `json:"slippage_avg"`
+	VolatilityPct    float64               `json:"volatility_pct"`
+	VolatilityRegime string                `json:"volatility_regime"`
+	LatencyBufferPct float64               `json:"latency_buffer_pct"`
+	TradesPerMinute  int                   `json:"trades_per_minute"`
+	OpenInterest     int64                 `json:"open_interest"`
+	FundingRate      float64               `json:"funding_rate"`
+	M1_SMA           float64               `json:"m1_sma"`
+	M1_SMASlope      float64               `json:"m1_sma_slope"`
+	BidPrices        []exchange.Price      `json:"bid_prices"`
+	AskPrices        []exchange.Price      `json:"ask_prices"`
+	MarkPrices       []exchange.Price      `json:"mark_prices"`
+	M1SMAPrices      []exchange.Price      `json:"m1_sma_prices"`
+	OBBidLevels      []exchange.Price      `json:"ob_bid_levels"`
+	OBAskLevels      []exchange.Price      `json:"ob_ask_levels"`
+	Trades           []dashboardTradePoint `json:"trades"`
+}
+
+type dashboardTradePoint struct {
+	Price      float64
+	StartPrice float64
+	EndPrice   float64
+	Size       float64
+	Time       time.Time
+	Side       string
 }
 
 func NewDashboard(model *Marketmaker, addr string) *Dashboard {
@@ -244,6 +259,10 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		.positive { color: #4ade80; }
 		.negative { color: #f87171; }
 		.neutral { color: #d1d5db; }
+		.regime-low { color: #4ade80; }
+		.regime-normal { color: #d1d5db; }
+		.regime-high { color: #facc15; }
+		.regime-extreme { color: #f87171; }
 		@media (max-width: 1100px) {
 			.pair-grid {
 				height: auto;
@@ -266,6 +285,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
 	<script>
 		const fmt = (value, digits = 6) => Number(value || 0).toFixed(digits);
+		const priceDigits = row => Number.isInteger(row?.price_decimals) ? row.price_decimals : 6;
+		const fmtPrice = (value, digits = 6) => fmt(value, digits);
 		const pct = (value, digits = 4) => fmt(value, digits) + '%';
 		const cls = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
 		const DASHBOARD_CHART_WINDOW_SECONDS = {{ .ChartWindowSeconds }};
@@ -340,15 +361,28 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						tooltip: {
 							callbacks: {
 								label: ctx => {
-									const base = ctx.dataset.label + ': ' + fmt(ctx.parsed.y);
+									const digits = Number.isInteger(ctx.chart.priceDecimals) ? ctx.chart.priceDecimals : 6;
+									const base = ctx.dataset.label + ': ' + fmtPrice(ctx.parsed.y, digits);
 									if (ctx.dataset.label !== 'trades') {
 										return base;
 									}
+									const start = ctx.dataset.tradeStarts && ctx.dataset.tradeStarts[ctx.dataIndex];
+									const end = ctx.dataset.tradeEnds && ctx.dataset.tradeEnds[ctx.dataIndex];
 									const sz = ctx.dataset.tradeSizes && ctx.dataset.tradeSizes[ctx.dataIndex];
+									const parts = [];
 									if (sz != null && Number.isFinite(sz) && sz > 0) {
-										return base + ' | size ' + fmt(sz, 6);
+										parts.push('size ' + fmt(sz, 6));
 									}
-									return base;
+									if (
+										start != null &&
+										end != null &&
+										Number.isFinite(start) &&
+										Number.isFinite(end) &&
+										start !== end
+									) {
+										parts.push('slippage ' + fmtPrice(start, digits) + ' -> ' + fmtPrice(end, digits));
+									}
+									return parts.length > 0 ? base + ' | ' + parts.join(' | ') : base;
 								},
 							},
 						},
@@ -360,7 +394,13 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						},
 						y: {
 							position: 'right',
-							ticks: { color: '#9ca3af' },
+							ticks: {
+								color: '#9ca3af',
+								callback: function(value) {
+									const digits = Number.isInteger(this.chart.priceDecimals) ? this.chart.priceDecimals : 6;
+									return fmtPrice(value, digits);
+								},
+							},
 							grid: { color: 'rgba(156, 163, 175, 0.12)' },
 						},
 					},
@@ -452,20 +492,28 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
+		function volatilityRegimeClass(regime) {
+			return 'regime-' + (regime || 'low');
+		}
+
 		function metricsHtml(row) {
+			const digits = priceDigits(row);
 			return '<div class="pair-title">' +
 				'<div class="symbol">' + row.symbol + '</div>' +
 			'</div>' +
 			'<div class="metric-grid">' +
-				metric('Mark Price', fmt(row.mark_price)) +
-				metric('Mid Price', fmt(row.mid_price)) +
-				metric('Last Traded', fmt(row.last_trade_price)) +
+				metric('Mark Price', fmtPrice(row.mark_price, digits)) +
+				metric('Mid Price', fmtPrice(row.mid_price, digits)) +
+				metric('Last Traded', fmtPrice(row.last_trade_price, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Spread Avg', pct(row.spread_avg), cls(row.spread_avg)) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
-				metric('Open Interest', fmt(row.open_interest, 2)) +
+				metric('Vol 10s', pct(row.volatility_pct), cls(row.volatility_pct)) +
+				metric('Vol Regime', row.volatility_regime || 'low', volatilityRegimeClass(row.volatility_regime)) +
+				metric('Latency Buffer', pct(row.latency_buffer_pct), cls(row.latency_buffer_pct)) +
+				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
-				metric('m1_SMA', fmt(row.m1_sma)) +
+				metric('m1_SMA', fmtPrice(row.m1_sma, digits)) +
 				metric('m1_SMA Slope', pct(row.m1_sma_slope), cls(row.m1_sma_slope)) +
 			'</div>';
 		}
@@ -528,6 +576,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
 			const chart = charts[rowKey(row)];
 			if (!chart) return;
+			chart.priceDecimals = priceDigits(row);
 			chart.data.labels = bids.map(price => new Date(price.Time).toLocaleTimeString());
 			chart.data.datasets[0].data = bids.map(price => price.Price);
 			chart.data.datasets[0].label = 'bid';
@@ -537,9 +586,12 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[2].label = 'mark';
 			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1smas);
 			chart.data.datasets[3].label = 'm1_SMA';
-			const tradeAlign = alignTradesToPrices(bids, trades);
+			const tradeAlign = alignTradesToPrices(bids, asks, trades);
 			chart.data.datasets[4].data = tradeAlign.prices;
 			chart.data.datasets[4].tradeSizes = tradeAlign.sizes;
+			chart.data.datasets[4].tradeStarts = tradeAlign.starts;
+			chart.data.datasets[4].tradeEnds = tradeAlign.ends;
+			chart.data.datasets[4].tradeSides = tradeAlign.sides;
 			const tradeRadii = radiiFromTradeSizes(tradeAlign.prices, tradeAlign.sizes);
 			chart.data.datasets[4].pointRadius = tradeRadii;
 			chart.data.datasets[4].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
@@ -654,9 +706,12 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			return aligned;
 		}
 
-		function alignTradesToPrices(prices, trades) {
+		function alignTradesToPrices(prices, askPrices, trades) {
 			const aligned = new Array(prices.length).fill(null);
 			const sizes = new Array(prices.length).fill(null);
+			const starts = new Array(prices.length).fill(null);
+			const ends = new Array(prices.length).fill(null);
+			const sides = new Array(prices.length).fill(null);
 			let priceIndex = 0;
 			for (const trade of trades) {
 				const tradeTime = new Date(trade.Time).getTime();
@@ -667,11 +722,24 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 					priceIndex++;
 				}
 				if (prices.length > 0) {
-					aligned[priceIndex] = trade.Price;
+					const end = trade.EndPrice || trade.Price;
+					let start = trade.StartPrice || end;
+					const side = trade.Side || '';
+					if (start === end) {
+						if (side === 'buy') {
+							start = askPrices[priceIndex]?.Price || start;
+						} else if (side === 'sell') {
+							start = prices[priceIndex]?.Price || start;
+						}
+					}
+					aligned[priceIndex] = end;
 					sizes[priceIndex] = trade.Size;
+					starts[priceIndex] = start;
+					ends[priceIndex] = end;
+					sides[priceIndex] = side;
 				}
 			}
-			return { prices: aligned, sizes: sizes };
+			return { prices: aligned, sizes: sizes, starts: starts, ends: ends, sides: sides };
 		}
 
 		function radiiFromTradeSizes(priceData, sizeData) {
@@ -793,6 +861,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 		}
 
 		obBids, obAsks := dashboardOrderbookLevels(strat.Exchange, pair, 20)
+		pairInfo, _ := strat.Exchange.Pair(pair)
+		priceDecimals := tickSizeDecimals(pairInfo.Base.TickSize)
 
 		t.RLock()
 		midPrice := t.Price
@@ -803,25 +873,29 @@ func (d *Dashboard) getDashboardData() DashboardData {
 		bidPrices, askPrices := splitBidAskPricePairs(prices)
 		sampleTime := latestPriceTime(bidPrices, askPrices)
 		row := DashboardPairData{
-			Exchange:        exchangeName,
-			Symbol:          t.Pair,
-			MarkPrice:       t.MarkPrice,
-			MidPrice:        midPrice,
-			LastTradePrice:  t.lastTradePrice,
-			SpreadAvg:       t.spreadAvg,
-			SlippageAvg:     t.slippageAvg,
-			TradesPerMinute: t.tradePerMinute,
-			OpenInterest:    t.openInterest,
-			FundingRate:     t.fundingRate,
-			M1_SMA:          t.m1_SMA,
-			M1_SMASlope:     t.m1_SMASlope,
-			BidPrices:       bidPrices,
-			AskPrices:       askPrices,
-			MarkPrices:      dashboardPricePoint(t.MarkPrice, sampleTime),
-			M1SMAPrices:     dashboardPricePoint(t.m1_SMA, sampleTime),
-			OBBidLevels:     obBids,
-			OBAskLevels:     obAsks,
-			Trades:          tradePricePoints(t.Trades),
+			Exchange:         exchangeName,
+			Symbol:           t.Pair,
+			PriceDecimals:    priceDecimals,
+			MarkPrice:        t.MarkPrice,
+			MidPrice:         midPrice,
+			LastTradePrice:   t.lastTradePrice,
+			SpreadAvg:        t.spreadAvg,
+			SlippageAvg:      t.slippageAvg,
+			VolatilityPct:    t.volatilityPct,
+			VolatilityRegime: t.volatilityRegime,
+			LatencyBufferPct: t.latencyBufferPct,
+			TradesPerMinute:  t.tradePerMinute,
+			OpenInterest:     int64(t.openInterest),
+			FundingRate:      t.fundingRate,
+			M1_SMA:           t.m1_SMA,
+			M1_SMASlope:      t.m1_SMASlope,
+			BidPrices:        bidPrices,
+			AskPrices:        askPrices,
+			MarkPrices:       dashboardPricePoint(t.MarkPrice, sampleTime),
+			M1SMAPrices:      dashboardPricePoint(t.m1_SMA, sampleTime),
+			OBBidLevels:      obBids,
+			OBAskLevels:      obAsks,
+			Trades:           tradePricePoints(t.Trades),
 		}
 		t.RUnlock()
 
@@ -862,14 +936,14 @@ func (d *Dashboard) applyHistory(key string, row *DashboardPairData) {
 	)
 	history.MarkPrices = trimDashboardPrices(mergeLatestPrices(history.MarkPrices, row.MarkPrices), cutoff)
 	history.M1SMAPrices = trimDashboardPrices(mergeLatestPrices(history.M1SMAPrices, row.M1SMAPrices), cutoff)
-	history.Trades = trimDashboardPrices(mergeLatestPrices(history.Trades, row.Trades), cutoff)
+	history.Trades = trimDashboardTrades(mergeLatestTrades(history.Trades, row.Trades), cutoff)
 
 	bids, asks := splitBidAskPricePairs(history.PairedQuotes)
 	row.BidPrices = copyLatestPrices(bids)
 	row.AskPrices = copyLatestPrices(asks)
 	row.MarkPrices = copyLatestPrices(history.MarkPrices)
 	row.M1SMAPrices = copyLatestPrices(history.M1SMAPrices)
-	row.Trades = copyLatestPrices(history.Trades)
+	row.Trades = copyLatestTrades(history.Trades)
 }
 
 func dashboardOrderbookLevels(exch exchange.I, pair string, levels int) ([]exchange.Price, []exchange.Price) {
@@ -904,8 +978,27 @@ func rowKey(row DashboardPairData) string {
 	return row.Exchange + ":" + row.Symbol
 }
 
+func tickSizeDecimals(tickSize float64) int {
+	if tickSize <= 0 {
+		return 6
+	}
+
+	scaled := tickSize
+	for decimals := 0; decimals <= 12; decimals++ {
+		if math.Abs(scaled-math.Round(scaled)) < 1e-9 {
+			return decimals
+		}
+		scaled *= 10
+	}
+	return 6
+}
+
 func copyLatestPrices(prices []exchange.Price) []exchange.Price {
 	return append([]exchange.Price(nil), prices...)
+}
+
+func copyLatestTrades(trades []dashboardTradePoint) []dashboardTradePoint {
+	return append([]dashboardTradePoint(nil), trades...)
 }
 
 func copyLatestPricePairs(prices [][2]exchange.Price) [][2]exchange.Price {
@@ -919,6 +1012,17 @@ func trimDashboardPrices(prices []exchange.Price, cutoff time.Time) []exchange.P
 			continue
 		}
 		filtered = append(filtered, price)
+	}
+	return filtered
+}
+
+func trimDashboardTrades(trades []dashboardTradePoint, cutoff time.Time) []dashboardTradePoint {
+	filtered := trades[:0]
+	for _, trade := range trades {
+		if !trade.Time.IsZero() && trade.Time.Before(cutoff) {
+			continue
+		}
+		filtered = append(filtered, trade)
 	}
 	return filtered
 }
@@ -1079,8 +1183,56 @@ func mergeLatestPrices(existing, incoming []exchange.Price) []exchange.Price {
 	return merged
 }
 
-func tradePricePoints(trades []exchange.Trade) []exchange.Price {
-	points := make([]exchange.Price, 0, len(trades))
+type tradePointKey struct {
+	Time       int64
+	Price      float64
+	StartPrice float64
+	EndPrice   float64
+	Size       float64
+	Side       string
+}
+
+func mergeLatestTrades(existing, incoming []dashboardTradePoint) []dashboardTradePoint {
+	seen := make(map[tradePointKey]struct{}, len(existing)+len(incoming))
+	merged := make([]dashboardTradePoint, 0, len(existing)+len(incoming))
+
+	add := func(trade dashboardTradePoint) {
+		if trade.Price <= 0 {
+			return
+		}
+
+		key := tradePointKey{
+			Time:       trade.Time.UnixNano(),
+			Price:      trade.Price,
+			StartPrice: trade.StartPrice,
+			EndPrice:   trade.EndPrice,
+			Size:       trade.Size,
+			Side:       trade.Side,
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+
+		seen[key] = struct{}{}
+		merged = append(merged, trade)
+	}
+
+	for _, trade := range incoming {
+		add(trade)
+	}
+	for _, trade := range existing {
+		add(trade)
+	}
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].Time.After(merged[j].Time)
+	})
+
+	return merged
+}
+
+func tradePricePoints(trades []exchange.Trade) []dashboardTradePoint {
+	points := make([]dashboardTradePoint, 0, len(trades))
 	for _, trade := range trades {
 		point, ok := tradePricePoint(trade)
 		if ok {
@@ -1090,20 +1242,24 @@ func tradePricePoints(trades []exchange.Trade) []exchange.Price {
 	return points
 }
 
-func tradePricePoint(trade exchange.Trade) (exchange.Price, bool) {
-	var price float64
+func tradePricePoint(trade exchange.Trade) (dashboardTradePoint, bool) {
+	var startPrice float64
+	var endPrice float64
 	var size float64
 	var ts time.Time
+	var side string
 
 	if trade.Order != nil {
-		price = trade.Order.Price
+		startPrice = trade.Order.Price
 		size = trade.Order.Size
 		ts = trade.Order.Time
+		side = strings.ToLower(trade.Order.Side)
 	}
 
 	if len(trade.Fills) > 0 {
 		var weightedPrice float64
 		var totalSize float64
+		var firstFillPrice float64
 		for _, fill := range trade.Fills {
 			if fill == nil || fill.Price <= 0 || fill.Size <= 0 {
 				continue
@@ -1111,25 +1267,55 @@ func tradePricePoint(trade exchange.Trade) (exchange.Price, bool) {
 			if ts.IsZero() {
 				ts = fill.Time
 			}
+			if side == "" {
+				side = strings.ToLower(fill.Side)
+			}
+			if firstFillPrice == 0 {
+				firstFillPrice = fill.Price
+			}
 			totalSize += fill.Size
 			weightedPrice += fill.Price * fill.Size
+			switch side {
+			case "buy":
+				if fill.Price > endPrice {
+					endPrice = fill.Price
+				}
+			case "sell":
+				if endPrice == 0 || fill.Price < endPrice {
+					endPrice = fill.Price
+				}
+			}
 		}
 		if totalSize > 0 {
-			price = weightedPrice / totalSize
+			if startPrice <= 0 {
+				startPrice = firstFillPrice
+			}
+			if endPrice <= 0 {
+				endPrice = weightedPrice / totalSize
+			}
 			size = totalSize
 		}
 	}
 
-	if price <= 0 {
-		return exchange.Price{}, false
+	if startPrice <= 0 {
+		startPrice = endPrice
+	}
+	if endPrice <= 0 {
+		endPrice = startPrice
+	}
+	if endPrice <= 0 {
+		return dashboardTradePoint{}, false
 	}
 	if ts.IsZero() {
 		ts = time.Now()
 	}
 
-	return exchange.Price{
-		Price: price,
-		Size:  size,
-		Time:  ts,
+	return dashboardTradePoint{
+		Price:      endPrice,
+		StartPrice: startPrice,
+		EndPrice:   endPrice,
+		Size:       size,
+		Time:       ts,
+		Side:       side,
 	}, true
 }
