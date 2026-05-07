@@ -218,7 +218,7 @@ func (e *Lighter) loadAssetsAndPairs() error {
 			NextFundingTime: nextHour(),
 		}
 		if funding, ok := fundingByID[book.MarketID]; ok {
-			pair.FundingRate = funding.Rate
+			pair.FundingRate = funding.Rate * 100
 		}
 
 		e.Assets[symbol] = asset
@@ -737,6 +737,7 @@ func (e *Lighter) handleOrderbook(pair string, resp lighterapi.LighterOrderBookR
 		}
 	}
 	ob.LastUpdated = now
+	snapshot := ob.Clone()
 
 	if pairData := e.Pairs[pair]; pairData != nil {
 		if len(ob.Bids) > 0 && len(ob.Asks) > 0 {
@@ -747,10 +748,10 @@ func (e *Lighter) handleOrderbook(pair string, resp lighterapi.LighterOrderBookR
 	e.Unlock()
 
 	select {
-	case e.Notifications.Orderbooks <- exchange.ExchangeUpdate[*exchange.Orderbook]{Pair: pair, Type: "orderbook", Data: ob}:
+	case e.Notifications.Orderbooks <- exchange.ExchangeUpdate[*exchange.Orderbook]{Pair: pair, Type: "orderbook", Data: &snapshot}:
 	default:
 	}
-	e.notifyUpdate(pair, "orderbook", ob)
+	e.notifyUpdate(pair, "orderbook", &snapshot)
 }
 
 func (e *Lighter) handleAccount(resp lighterapi.LighterAccountResponse) {

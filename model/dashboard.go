@@ -54,12 +54,12 @@ type DashboardPairData struct {
 	PriceDecimals    int                   `json:"price_decimals"`
 	MarkPrice        float64               `json:"mark_price"`
 	MidPrice         float64               `json:"mid_price"`
-	LastTradePrice   float64               `json:"last_trade_price"`
 	SpreadAvg        float64               `json:"spread_avg"`
 	SlippageAvg      float64               `json:"slippage_avg"`
+	VPOC             float64               `json:"vpoc"`
+	VolumePct        float64               `json:"volume_pct"`
 	VolatilityPct    float64               `json:"volatility_pct"`
 	VolatilityRegime string                `json:"volatility_regime"`
-	LatencyBufferPct float64               `json:"latency_buffer_pct"`
 	TradesPerMinute  int                   `json:"trades_per_minute"`
 	OpenInterest     int64                 `json:"open_interest"`
 	FundingRate      float64               `json:"funding_rate"`
@@ -341,6 +341,16 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						pointHoverRadius: 0,
 						tension: 0,
 					}, {
+						label: 'VPOC',
+						data: [],
+						borderColor: '#dbdbdb',
+						backgroundColor: 'rgba(219, 219, 219, 0.10)',
+						borderWidth: 1.4,
+						borderDash: [6, 4],
+						pointRadius: 0,
+						pointHoverRadius: 0,
+						tension: 0,
+					}, {
 						label: 'trades',
 						data: [],
 						borderColor: 'rgba(255, 255, 255, 0.7)',
@@ -504,13 +514,13 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'<div class="metric-grid">' +
 				metric('Mark Price', fmtPrice(row.mark_price, digits)) +
 				metric('Mid Price', fmtPrice(row.mid_price, digits)) +
-				metric('Last Traded', fmtPrice(row.last_trade_price, digits)) +
+				metric('VPOC', fmtPrice(row.vpoc, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
+				metric('Volume Imb', pct(row.volume_pct), cls(row.volume_pct)) +
 				metric('Spread Avg', pct(row.spread_avg), cls(row.spread_avg)) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
 				metric('Vol 10s', pct(row.volatility_pct), cls(row.volatility_pct)) +
 				metric('Vol Regime', row.volatility_regime || 'low', volatilityRegimeClass(row.volatility_regime)) +
-				metric('Latency Buffer', pct(row.latency_buffer_pct), cls(row.latency_buffer_pct)) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
 				metric('m1_SMA', fmtPrice(row.m1_sma, digits)) +
@@ -586,16 +596,18 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[2].label = 'mark';
 			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1smas);
 			chart.data.datasets[3].label = 'm1_SMA';
+			chart.data.datasets[4].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
+			chart.data.datasets[4].label = 'VPOC';
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
-			chart.data.datasets[4].data = tradeAlign.prices;
-			chart.data.datasets[4].tradeSizes = tradeAlign.sizes;
-			chart.data.datasets[4].tradeStarts = tradeAlign.starts;
-			chart.data.datasets[4].tradeEnds = tradeAlign.ends;
-			chart.data.datasets[4].tradeSides = tradeAlign.sides;
+			chart.data.datasets[5].data = tradeAlign.prices;
+			chart.data.datasets[5].tradeSizes = tradeAlign.sizes;
+			chart.data.datasets[5].tradeStarts = tradeAlign.starts;
+			chart.data.datasets[5].tradeEnds = tradeAlign.ends;
+			chart.data.datasets[5].tradeSides = tradeAlign.sides;
 			const tradeRadii = radiiFromTradeSizes(tradeAlign.prices, tradeAlign.sizes);
-			chart.data.datasets[4].pointRadius = tradeRadii;
-			chart.data.datasets[4].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
-			chart.data.datasets[4].label = 'trades';
+			chart.data.datasets[5].pointRadius = tradeRadii;
+			chart.data.datasets[5].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
+			chart.data.datasets[5].label = 'trades';
 			setPriceScale(chart, bids, asks, marks, tradeAlign.prices);
 			chart.update('none');
 			renderOrderbookDepth(i, chart, row.ob_bid_levels || [], row.ob_ask_levels || []);
@@ -878,12 +890,12 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			PriceDecimals:    priceDecimals,
 			MarkPrice:        t.MarkPrice,
 			MidPrice:         midPrice,
-			LastTradePrice:   t.lastTradePrice,
 			SpreadAvg:        t.spreadAvg,
 			SlippageAvg:      t.slippageAvg,
+			VPOC:             t.vpoc,
+			VolumePct:        t.volumePct,
 			VolatilityPct:    t.volatilityPct,
 			VolatilityRegime: t.volatilityRegime,
-			LatencyBufferPct: t.latencyBufferPct,
 			TradesPerMinute:  t.tradePerMinute,
 			OpenInterest:     int64(t.openInterest),
 			FundingRate:      t.fundingRate,

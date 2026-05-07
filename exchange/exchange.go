@@ -115,12 +115,12 @@ type I interface {
 	Pair(pair string) (Pair, error) // returns a specific pair by name
 	GetPairs() map[string]Pair      // returns all pairs on the exchange
 	// Exchange states
-	GetOrder(pair string) ([]Order, error)       // uses Exchange struct: returns orders for a pair
-	GetOrders() map[string]Order                 // uses Exchange struct: returns all orders
-	GetPosition(pair string) (Position, error)   // uses Exchange struct: returns position for a pair
-	GetPositions() map[string]Position           // uses Exchange struct: returns all positions
-	GetOrderbook(pair string) (Orderbook, error) // uses Exchange struct: returns orderbook for a pair
-	GetOrderbooks() map[string]Orderbook         // uses Exchange struct: returns all orderbooks
+	GetOrder(pair string) ([]Order, error)       // returns orders for a pair
+	GetOrders() map[string]Order                 // returns all orders
+	GetPosition(pair string) (Position, error)   // returns position for a pair
+	GetPositions() map[string]Position           // returns all positions
+	GetOrderbook(pair string) (Orderbook, error) // returns orderbook for a pair
+	GetOrderbooks() map[string]Orderbook         // returns all orderbooks
 	// Exchange requests
 	GetBars(pair, interval string, length int) ([]Bar, error) // USER IMPLEMENTATION: returns historical bars
 	PlaceOrders([]Order) error                                // USER IMPLEMENTATION: places new orders
@@ -264,7 +264,7 @@ func (e *Exchange) GetOrderbook(pair string) (Orderbook, error) {
 	defer e.RUnlock()
 
 	if ob, exists := e.Orderbook[pair]; exists {
-		return *ob, nil
+		return ob.Clone(), nil
 	}
 
 	return Orderbook{}, fmt.Errorf("orderbook %s not found", pair)
@@ -277,7 +277,7 @@ func (e *Exchange) GetOrderbooks() map[string]Orderbook {
 
 	orderbooks := make(map[string]Orderbook)
 	for pair, ob := range e.Orderbook {
-		orderbooks[pair] = *ob
+		orderbooks[pair] = ob.Clone()
 	}
 	return orderbooks
 }

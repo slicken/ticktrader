@@ -267,7 +267,7 @@ func (e *Lighter) handleRawMarketStats(symbol string, data []byte) error {
 			pairData.OpenInterest = openInterest
 		}
 		if fundingRate, ok := parseFloat(msg.MarketStats.CurrentFundingRate); ok {
-			pairData.FundingRate = fundingRate
+			pairData.FundingRate = fundingRate * 100
 		}
 		if msg.MarketStats.DailyQuoteTokenVolume != nil {
 			pairData.Volume = *msg.MarketStats.DailyQuoteTokenVolume

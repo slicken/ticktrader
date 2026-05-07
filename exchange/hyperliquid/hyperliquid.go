@@ -973,23 +973,9 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 
 	coin := orderbook["coin"].(string)
 
-	e.Lock()
-	// Try to reuse existing orderbook
-	ob, exists := e.Orderbook[coin]
-	if !exists {
-		// Create new orderbook only if it doesn't exist
-		ob = &exchange.Orderbook{
-			Pair: coin,
-			Bids: make([]exchange.Price, 0, len(bidsSlice)),
-			Asks: make([]exchange.Price, 0, len(asksSlice)),
-		}
-		e.Orderbook[coin] = ob
-	} else {
-		// Reuse existing slices by truncating and reusing capacity
-		ob.Bids = ob.Bids[:0] // Keep capacity, clear length
-		ob.Asks = ob.Asks[:0] // Keep capacity, clear length
-	}
-	e.Unlock()
+	now := time.Now()
+	asks := make([]exchange.Price, 0, len(asksSlice))
+	bids := make([]exchange.Price, 0, len(bidsSlice))
 
 	// Process asks using the old untyped logic
 	for _, ask := range asksSlice {
@@ -1005,9 +991,10 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 			continue
 		}
 
-		ob.Asks = append(ob.Asks, exchange.Price{
+		asks = append(asks, exchange.Price{
 			Price: price,
 			Size:  size,
+			Time:  now,
 		})
 	}
 
@@ -1025,21 +1012,32 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 			continue
 		}
 
-		ob.Bids = append(ob.Bids, exchange.Price{
+		bids = append(bids, exchange.Price{
 			Price: price,
 			Size:  size,
+			Time:  now,
 		})
 	}
 
-	// Update timestamp
-	ob.LastUpdated = time.Now()
+	e.Lock()
+	ob, exists := e.Orderbook[coin]
+	if !exists {
+		ob = &exchange.Orderbook{Pair: coin}
+		e.Orderbook[coin] = ob
+	}
+	ob.Asks = asks
+	ob.Bids = bids
+	ob.Sort()
+	ob.LastUpdated = now
+	snapshot := ob.Clone()
+	e.Unlock()
 
 	// Send our Exchange orderbook to notifications
 	select {
 	case e.Notifications.Orderbooks <- exchange.ExchangeUpdate[*exchange.Orderbook]{
 		Pair: coin,
 		Type: "orderbook",
-		Data: ob,
+		Data: &snapshot,
 	}:
 	default:
 	}

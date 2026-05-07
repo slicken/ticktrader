@@ -46,6 +46,8 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 		volPct = ((bidsVol - asksVol) / (bidsVol + asksVol)) * 100
 	}
 
+	vpoc := t.calculateSimpleVPOC(VPOC_ORDERBOOK_LEVEL)
+
 	t.Lock()
 	defer t.Unlock()
 
@@ -54,17 +56,9 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	t.asksVol = asksVol
 	t.bidsVol = bidsVol
 	t.volumePct = volPct
+	t.vpoc = vpoc
 	mid := (bid + ask) / 2
 	spreadPct := ((ask - bid) / mid) * 100
-	priceTime := bidPrice.Time
-	if priceTime.IsZero() {
-		priceTime = askPrice.Time
-	}
-	if priceTime.IsZero() {
-		priceTime = time.Now()
-	}
-	bidPrice.Time = priceTime
-	askPrice.Time = priceTime
 	insertWithLimitInPlace(&t.Prices, [2]exchange.Price{bidPrice, askPrice}, ARRAY_SIZE)
 	insertWithLimitInPlace(&t.spreadPct, spreadPct, ARRAY_SIZE)
 	rawVolatilityPct := calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW)
@@ -182,6 +176,111 @@ func (t *trader) calculateOBVolPct(levels int) (float64, float64, float64) {
 	bidsVol := bidDepth * ob.Bids[0].Price
 	imbalance := (bidDepth - askDepth) / totalDepth
 	return asksVol, bidsVol, imbalance * 100.0
+}
+
+type SimpleVPOC struct {
+	Buckets     map[int64]float64
+	BucketSize  float64
+	DecayFactor float64
+}
+
+func (t *trader) calculateSimpleVPOC(levels int) float64 {
+	// 1. Safety Checks & Orderbook Retrieval
+	if t.parent == nil || t.parent.Exchange == nil || levels <= 0 {
+		return 0
+	}
+
+	ob, err := t.parent.Exchange.GetOrderbook(t.Pair)
+	if err != nil || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+		return 0
+	}
+
+	// Calculate Mid Price
+	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
+	if mid <= 0 {
+		return 0
+	}
+
+	// 2. Initialize Struct & BucketSize
+	if t.vpocProfile.Buckets == nil {
+		pair, err := t.parent.Exchange.Pair(t.Pair)
+		if err != nil || pair.Base.TickSize <= 0 {
+			return 0
+		}
+
+		t.vpocProfile.Buckets = make(map[int64]float64)
+		t.vpocProfile.BucketSize = math.Max(mid*(VPOC_BUCKET_PCT/100), pair.Base.TickSize)
+		t.vpocProfile.DecayFactor = VPOC_DECAY_FACTOR
+	}
+
+	if t.vpocProfile.BucketSize <= 0 {
+		return 0
+	}
+
+	// Calculate current index and the 0.25% distance boundary
+	currentIdx := int64(math.Floor(mid / t.vpocProfile.BucketSize))
+	maxDistance := mid * ((VPOC_RANGE_PCT / 2) / 100)
+
+	// 3. SELECTIVE DECAY (The "Eating" Mechanism)
+	// We decay the current bucket faster to simulate price "consuming" liquidity
+	for idx, volume := range t.vpocProfile.Buckets {
+		decay := t.vpocProfile.DecayFactor
+
+		// If price is currently IN this bucket, "eat" it away 3x faster
+		if idx == currentIdx {
+			decay *= 0.3
+		}
+
+		t.vpocProfile.Buckets[idx] = volume * decay
+
+		// Clean up dust to keep the map small
+		if t.vpocProfile.Buckets[idx] <= 1e-12 {
+			delete(t.vpocProfile.Buckets, idx)
+		}
+	}
+
+	// 4. AGGREGATE (With Range Limit)
+	process := func(bookLevels []exchange.Price) {
+		for i := 0; i < levels && i < len(bookLevels); i++ {
+			level := bookLevels[i]
+
+			// Boundary Check: Ignore orders further than 0.25% from mid
+			if math.Abs(level.Price-mid) > maxDistance {
+				break // Stop early since orderbook is sorted
+			}
+
+			if level.Price <= 0 || level.Size <= 0 {
+				continue
+			}
+
+			idx := int64(math.Floor(level.Price / t.vpocProfile.BucketSize))
+			t.vpocProfile.Buckets[idx] += level.Size
+		}
+	}
+	process(ob.Bids)
+	process(ob.Asks)
+
+	// 5. SELECTION (Neighborhood Mass)
+	// We find the strongest "area" rather than a single tick to handle split clusters
+	var bestIdx int64
+	var maxAreaVolume float64
+
+	for idx, volume := range t.vpocProfile.Buckets {
+		// Sum current bucket with neighbors
+		areaVolume := volume + t.vpocProfile.Buckets[idx+1] + t.vpocProfile.Buckets[idx-1]
+
+		if areaVolume > maxAreaVolume {
+			maxAreaVolume = areaVolume
+			bestIdx = idx
+		}
+	}
+
+	if maxAreaVolume <= 0 {
+		return 0
+	}
+
+	// Return the center of the highest volume bucket in that neighborhood
+	return float64(bestIdx)*t.vpocProfile.BucketSize + t.vpocProfile.BucketSize/2
 }
 
 func (t *trader) updateTrade(trade *exchange.Trade) {
