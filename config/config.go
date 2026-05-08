@@ -32,8 +32,7 @@ type ExchangeConfig struct {
 // ModelConfig holds all model parameters
 type ModelConfig struct {
 	// Trading Pair Parameters
-	Pairs         []string `json:"pairs"`          // Trading pairs (e.g., ["BTC", "ETH", "SOL"])
-	DisabledPairs []string `json:"pairs_disabled"` // Pairs to exclude from trading (e.g., ["USDT", "USDC"])
+	Pairs []string `json:"pairs"` // Trading pairs (e.g., ["BTC", "ETH", "SOL"])
 }
 
 // LoadConfig loads configuration from a file
@@ -105,6 +104,5 @@ func (sc *ModelConfig) Print() {
 	log.Printf("MODEL CONFIGURATION:")
 	log.Println("Trader Settings:")
 	log.Printf("  Pairs                : %v", sc.Pairs)
-	log.Printf("  Disabled Pairs       : %v", sc.DisabledPairs)
 	log.Println()
 }

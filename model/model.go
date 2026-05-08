@@ -13,6 +13,8 @@ import (
 )
 
 const (
+	// pct values are real percentage values, not rations. (eg. 1 = 1%, 0.5 = 0.5%)
+
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
 	EMA_ALPHA              = 0.1  // Smoothing factor for exponential moving average calculations
@@ -98,23 +100,9 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 			if !found {
 				continue
 			}
-		}
 
-		// check if disabled
-		if len(cfg.DisabledPairs) > 0 {
-			disabled := false
-			for _, p := range cfg.DisabledPairs {
-				if p == pairName {
-					disabled = true
-					break
-				}
-			}
-			if disabled {
-				continue
-			}
+			pairs = append(pairs, pairName)
 		}
-
-		pairs = append(pairs, pairName)
 	}
 
 	for _, pair := range pairs {
@@ -265,19 +253,10 @@ func (strat *Marketmaker) Start(ctx context.Context) {
 // Stop cancels all open orders and closes all positions for enabled pairs.
 // Pairs listed in config DisabledPairs are skipped (no order cancel/position close).
 func (strat *Marketmaker) Stop() {
-	// Build disabled set for quick lookup
-	disabled := make(map[string]struct{}, len(strat.config.DisabledPairs))
-	for _, p := range strat.config.DisabledPairs {
-		disabled[p] = struct{}{}
-	}
-
 	// Cancel open orders for enabled pairs only
 	existingOrders := strat.Exchange.GetOrders()
 	ordersToCancel := make([]exchange.Order, 0, len(existingOrders))
 	for _, o := range existingOrders {
-		if _, skip := disabled[o.Pair]; skip {
-			continue
-		}
 		ordersToCancel = append(ordersToCancel, o)
 	}
 	if len(ordersToCancel) > 0 {
@@ -289,9 +268,6 @@ func (strat *Marketmaker) Stop() {
 	closeOrders := make([]exchange.Order, 0, len(positions))
 	for pair, pos := range positions {
 		if pos.Size == 0 {
-			continue
-		}
-		if _, skip := disabled[pair]; skip {
 			continue
 		}
 		var side string

@@ -135,7 +135,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			padding: 12px;
 			background-color: #1a1a1a;
 			color: #ffffff;
-			overflow: hidden;
+			overflow: auto;
 		}
 		.meta {
 			color: #9ca3af;
@@ -145,8 +145,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		.pair-grid {
 			display: grid;
 			gap: 8px;
-			height: calc(100vh - 44px);
-			min-height: 0;
+			min-height: calc(100vh - 44px);
 			--metric-scale: 1;
 			--metric-grid-columns: repeat(auto-fit, minmax(112px, 1fr));
 			--metrics-column: 34%;
@@ -253,7 +252,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			position: absolute;
 			right: 14px;
 			height: 20px;
-			min-height: 20px;
 			opacity: 0.3;
 			border-radius: 2px;
 		}
@@ -488,11 +486,34 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			};
 		}
 
+		function visibleChartRows(rowCount) {
+			return Math.min(Math.max(rowCount || 1, 1), 2);
+		}
+
+		function dashboardHeightPx() {
+			return Math.max(window.innerHeight - 44, 240);
+		}
+
+		function chartRowHeightPx(rowCount) {
+			const visibleRows = visibleChartRows(rowCount);
+			const rowGap = 8;
+			const availableHeight = dashboardHeightPx() - (rowGap * (visibleRows - 1));
+			return Math.max(180, Math.floor(availableHeight / visibleRows));
+		}
+
+		function applyChartRowSizing(rowCount) {
+			const grid = document.getElementById('pair-grid');
+			const count = Math.max(rowCount || renderedKeys.length || 1, 1);
+			const rowHeight = chartRowHeightPx(count);
+			grid.style.gridTemplateRows = count > 0
+				? 'repeat(' + count + ', minmax(0, ' + rowHeight + 'px))'
+				: '1fr';
+		}
+
 		function adaptMetricSizing(rowCount) {
 			const grid = document.getElementById('pair-grid');
 			const count = Math.max(rowCount || renderedKeys.length || 1, 1);
-			const gridHeight = grid.clientHeight || Math.max(window.innerHeight - 44, 0);
-			const rowHeight = gridHeight / count;
+			const rowHeight = chartRowHeightPx(count);
 			const scale = clamp(0.95, rowHeight / 230, 2.05);
 			const minWidth = Math.round(clamp(112, 112 + ((scale - 1) * 70), 190));
 			const metricColumns = rowHeight >= 250 ? 'repeat(3, minmax(0, 1fr))' : 'repeat(auto-fit, minmax(' + minWidth + 'px, 1fr))';
@@ -527,8 +548,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				'<div class="symbol">' + row.symbol + '</div>' +
 			'</div>' +
 			'<div class="metric-grid">' +
-				metric('Mark Price', fmtPrice(row.mark_price, digits)) +
-				metric('Mid Price', fmtPrice(row.mid_price, digits)) +
 				metric('VPOC', fmtPrice(row.vpoc, digits)) +
 				compactMetric('OB Window', fmtPrice(row.ob_min_price, digits) + ' / ' + fmtPrice(row.ob_max_price, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
@@ -555,9 +574,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			renderedKeys = keys;
 
 			const grid = document.getElementById('pair-grid');
-			grid.style.gridTemplateRows = rows.length > 0
-				? 'repeat(' + rows.length + ', minmax(0, 1fr))'
-				: '1fr';
+			applyChartRowSizing(rows.length);
 			adaptMetricSizing(rows.length);
 			grid.innerHTML = rows.map((row, i) =>
 				'<section class="pair-section">' +
@@ -653,6 +670,34 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.options.scales.y.max = max + padding;
 		}
 
+		function measuredChartHeightPx(chart) {
+			const chartArea = chart?.chartArea;
+			if (
+				chartArea &&
+				Number.isFinite(chartArea.top) &&
+				Number.isFinite(chartArea.bottom) &&
+				chartArea.bottom > chartArea.top
+			) {
+				return chartArea.bottom - chartArea.top;
+			}
+			return chart?.canvas?.clientHeight || chart?.height || 0;
+		}
+
+		function volumeNodeHeightPx(chart) {
+			const chartHeight = measuredChartHeightPx(chart);
+			const canvasHeight = chart?.canvas?.clientHeight || chart?.height || chartHeight;
+			if (!(chartHeight > 0) || !(canvasHeight > 0)) {
+				return 20;
+			}
+
+			const fullSizeChartHeight = chartHeight * (chartRowHeightPx(1) / canvasHeight);
+			if (!(fullSizeChartHeight > 0)) {
+				return 20;
+			}
+
+			return Math.round(clamp(4, 20 * (chartHeight / fullSizeChartHeight), 20));
+		}
+
 		function renderOrderbookDepth(index, chart, bidLevels, askLevels) {
 			const overlay = document.getElementById('depth-' + index);
 			if (!overlay || !chart || !chart.scales || !chart.scales.y) {
@@ -699,6 +744,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				return;
 			}
 
+			const nodeHeight = volumeNodeHeightPx(chart);
 			const draw = (steps, cls) => {
 				let cumulative = 0;
 				for (let i = 0; i < steps.length; i++) {
@@ -708,7 +754,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 					const el = document.createElement('div');
 					el.className = 'depth-level ' + cls;
 					el.style.width = widthPct + '%';
-					const top = Math.min(chartArea.bottom - 20, Math.max(chartArea.top, step.y - 10));
+					el.style.height = nodeHeight + 'px';
+					const top = Math.min(chartArea.bottom - nodeHeight, Math.max(chartArea.top, step.y - (nodeHeight / 2)));
 					el.style.top = Math.round(top) + 'px';
 					overlay.appendChild(el);
 				}
@@ -837,7 +884,11 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
 		refresh();
 		setInterval(refresh, DASHBOARD_REFRESH_MS);
-		window.addEventListener('resize', () => adaptMetricSizing(renderedKeys.length));
+		window.addEventListener('resize', () => {
+			applyChartRowSizing(renderedKeys.length);
+			adaptMetricSizing(renderedKeys.length);
+			Object.values(charts).forEach(chart => chart.resize());
+		});
 	</script>
 </body>
 </html>`
