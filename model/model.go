@@ -25,10 +25,11 @@ const (
 	VOLATILITY_HIGH_PCT    = 0.02             // Threshold for "high" volatility regime, as a pct of price
 	VOLATILITY_EXTREME_PCT = 0.05             // Threshold for "extreme" volatility regime, as a pct of price
 
-	ORDERBOOK_LEVEL   = 200  // How many orderbook levels to pull/analyze when reading book data
-	VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
-	VPOC_DECAY_FACTOR = 0.8  // Standard decay multiplier
-	VPOC_RANGE_PCT    = 0.5  // Only consider orders within 0.25% of mid (total 0.5%)
+	ORDERBOOK_LEVEL             = 200  // How many orderbook levels to pull/analyze when reading book data
+	ORDERBOOK_WEIGHT_FACTOR     = 1.7  // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
+	ORDERBOOK_RANGE_PCT         = 0.5  // Only analyse orders within this/2 percent range from mid
+	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
+	ORDERBOOK_VPOC_DECAY_FACTOR = 0.7  // Standard decay multiplier
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -180,7 +181,7 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		bidsVol:          0,
 		volumePct:        0,
 		vpoc:             0,
-		vpocProfile:      VPOCProfile{DecayFactor: VPOC_DECAY_FACTOR},
+		vpocProfile:      VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
 		volatilityPct:    0,
 		volatilityRegime: "low",
 		latencyBufferPct: 0,

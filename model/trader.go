@@ -152,8 +152,104 @@ func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
 	t.vpoc = vpoc
 }
 
-// calculateOrderbook uses one orderbook snapshot to calculate volume
-// imbalance and update the VPOC profile.
+// // calculateOrderbook uses one orderbook snapshot to calculate volume
+// // imbalance and update the VPOC profile.
+// func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64, float64, float64, float64) {
+// 	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+// 		return 0, 0, 0, 0
+// 	}
+
+// 	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
+// 	if mid <= 0 {
+// 		return 0, 0, 0, 0
+// 	}
+
+// 	if t.vpocProfile.Buckets == nil {
+// 		if t.parent != nil && t.parent.Exchange != nil {
+// 			pair, err := t.parent.Exchange.Pair(t.Pair)
+// 			if err == nil && pair.Base.TickSize > 0 {
+// 				t.vpocProfile.Buckets = make(map[int64]float64)
+// 				t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), pair.Base.TickSize)
+// 				t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
+// 			}
+// 		}
+// 	}
+
+// 	var currentIdx int64
+// 	vpocEnabled := t.vpocProfile.BucketSize > 0 && t.vpocProfile.Buckets != nil
+// 	if vpocEnabled {
+// 		currentIdx = int64(math.Floor(mid / t.vpocProfile.BucketSize))
+// 		for idx, volume := range t.vpocProfile.Buckets {
+// 			decay := t.vpocProfile.DecayFactor
+// 			if idx == currentIdx {
+// 				decay *= 0.3
+// 			}
+
+// 			t.vpocProfile.Buckets[idx] = volume * decay
+// 			if t.vpocProfile.Buckets[idx] <= 1e-12 {
+// 				delete(t.vpocProfile.Buckets, idx)
+// 			}
+// 		}
+// 	}
+
+// 	maxDistance := mid * ((ORDERBOOK_RANGE_PCT / 2) / 100)
+// 	var bidDepth, askDepth float64
+// 	process := func(bookLevels []exchange.Price, addDepth func(float64)) {
+// 		for i := 0; i < levels && i < len(bookLevels); i++ {
+// 			level := bookLevels[i]
+// 			if level.Price <= 0 || level.Size <= 0 {
+// 				continue
+// 			}
+// 			if math.Abs(level.Price-mid) > maxDistance {
+// 				break
+// 			}
+
+// 			addDepth(level.Size)
+// 			if vpocEnabled {
+// 				idx := int64(math.Floor(level.Price / t.vpocProfile.BucketSize))
+// 				t.vpocProfile.Buckets[idx] += level.Size
+// 			}
+// 		}
+// 	}
+// 	process(ob.Bids, func(size float64) { bidDepth += size })
+// 	process(ob.Asks, func(size float64) { askDepth += size })
+
+// 	totalDepth := bidDepth + askDepth
+// 	if totalDepth == 0 {
+// 		return 0, 0, 0, 0
+// 	}
+
+// 	asksVol := askDepth * ob.Asks[0].Price
+// 	bidsVol := bidDepth * ob.Bids[0].Price
+// 	imbalance := ((bidDepth - askDepth) / totalDepth) * 100.0
+// 	if !vpocEnabled {
+// 		return asksVol, bidsVol, imbalance, 0
+// 	}
+
+// 	var bestIdx int64
+// 	var maxAreaVolume float64
+// 	for idx, volume := range t.vpocProfile.Buckets {
+// 		areaVolume := volume + t.vpocProfile.Buckets[idx+1] + t.vpocProfile.Buckets[idx-1]
+// 		if areaVolume > maxAreaVolume {
+// 			maxAreaVolume = areaVolume
+// 			bestIdx = idx
+// 		}
+// 	}
+
+// 	if maxAreaVolume <= 0 {
+// 		return asksVol, bidsVol, imbalance, 0
+// 	}
+
+// 	vpoc := float64(bestIdx)*t.vpocProfile.BucketSize + t.vpocProfile.BucketSize/2
+// 	return asksVol, bidsVol, imbalance, vpoc
+// }
+
+type VPOCProfile struct {
+	Buckets     map[int64]float64
+	BucketSize  float64
+	DecayFactor float64
+}
+
 func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64, float64, float64, float64) {
 	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
 		return 0, 0, 0, 0
@@ -164,71 +260,96 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 		return 0, 0, 0, 0
 	}
 
-	if t.vpocProfile.Buckets == nil {
-		if t.parent != nil && t.parent.Exchange != nil {
-			pair, err := t.parent.Exchange.Pair(t.Pair)
-			if err == nil && pair.Base.TickSize > 0 {
-				t.vpocProfile.Buckets = make(map[int64]float64)
-				t.vpocProfile.BucketSize = math.Max(mid*(VPOC_BUCKET_PCT/100), pair.Base.TickSize)
-				t.vpocProfile.DecayFactor = VPOC_DECAY_FACTOR
-			}
+	// VPOC Initialization
+	if t.vpocProfile.Buckets == nil && t.parent != nil && t.parent.Exchange != nil {
+		pair, err := t.parent.Exchange.Pair(t.Pair)
+		if err == nil && pair.Base.TickSize > 0 {
+			t.vpocProfile.Buckets = make(map[int64]float64)
+			t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), pair.Base.TickSize)
+			t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
 		}
 	}
 
-	var currentIdx int64
 	vpocEnabled := t.vpocProfile.BucketSize > 0 && t.vpocProfile.Buckets != nil
+
+	// 1. Guarded VPOC Math
 	if vpocEnabled {
-		currentIdx = int64(math.Floor(mid / t.vpocProfile.BucketSize))
+		currentMidIdx := int64(math.Floor(mid / t.vpocProfile.BucketSize))
 		for idx, volume := range t.vpocProfile.Buckets {
 			decay := t.vpocProfile.DecayFactor
-			if idx == currentIdx {
-				decay *= 0.3
+			if idx == currentMidIdx {
+				decay = math.Min(1.0, decay*1.05)
 			}
-
 			t.vpocProfile.Buckets[idx] = volume * decay
-			if t.vpocProfile.Buckets[idx] <= 1e-12 {
+			if t.vpocProfile.Buckets[idx] <= 1e-8 {
 				delete(t.vpocProfile.Buckets, idx)
 			}
 		}
 	}
 
-	maxDistance := mid * ((VPOC_RANGE_PCT / 2) / 100)
-	var bidDepth, askDepth float64
-	process := func(bookLevels []exchange.Price, addDepth func(float64)) {
+	maxDistance := mid * ((ORDERBOOK_RANGE_PCT / 2) / 100)
+	var weightedBidNotional, weightedAskNotional float64
+	var actualBidNotional, actualAskNotional float64
+
+	process := func(bookLevels []exchange.Price, isBid bool) {
 		for i := 0; i < levels && i < len(bookLevels); i++ {
 			level := bookLevels[i]
-			if level.Price <= 0 || level.Size <= 0 {
+			dist := math.Abs(level.Price - mid)
+
+			if level.Price <= 0 || level.Size <= 0 || dist > maxDistance {
+				if isBid && level.Price < (mid-maxDistance) {
+					break
+				}
+				if !isBid && level.Price > (mid+maxDistance) {
+					break
+				}
 				continue
 			}
-			if math.Abs(level.Price-mid) > maxDistance {
-				break
+
+			weight := 1.0
+			if ORDERBOOK_WEIGHT_FACTOR > 0 {
+				weight = 1.0 / (1.0 + (dist/mid)*ORDERBOOK_WEIGHT_FACTOR*100)
 			}
 
-			addDepth(level.Size)
+			// 3. Consistent Notional Imbalance
+			notional := level.Price * level.Size
+			if isBid {
+				weightedBidNotional += notional * weight
+				actualBidNotional += notional
+			} else {
+				weightedAskNotional += notional * weight
+				actualAskNotional += notional
+			}
+
 			if vpocEnabled {
 				idx := int64(math.Floor(level.Price / t.vpocProfile.BucketSize))
-				t.vpocProfile.Buckets[idx] += level.Size
+				t.vpocProfile.Buckets[idx] += notional
 			}
 		}
 	}
-	process(ob.Bids, func(size float64) { bidDepth += size })
-	process(ob.Asks, func(size float64) { askDepth += size })
 
-	totalDepth := bidDepth + askDepth
-	if totalDepth == 0 {
-		return 0, 0, 0, 0
+	process(ob.Bids, true)
+	process(ob.Asks, false)
+
+	totalWeightedNotional := weightedBidNotional + weightedAskNotional
+	imbalance := 0.0
+	if totalWeightedNotional > 0 {
+		imbalance = ((weightedBidNotional - weightedAskNotional) / totalWeightedNotional) * 100.0
 	}
 
-	asksVol := askDepth * ob.Asks[0].Price
-	bidsVol := bidDepth * ob.Bids[0].Price
-	imbalance := ((bidDepth - askDepth) / totalDepth) * 100.0
 	if !vpocEnabled {
-		return asksVol, bidsVol, imbalance, 0
+		return actualAskNotional, actualBidNotional, imbalance, 0
 	}
 
+	// 2. Optimized VPOC Search
 	var bestIdx int64
 	var maxAreaVolume float64
 	for idx, volume := range t.vpocProfile.Buckets {
+		// Ignore empty buffer buckets or heavily decayed noise
+		if volume <= 1e-6 {
+			continue
+		}
+
 		areaVolume := volume + t.vpocProfile.Buckets[idx+1] + t.vpocProfile.Buckets[idx-1]
 		if areaVolume > maxAreaVolume {
 			maxAreaVolume = areaVolume
@@ -237,17 +358,11 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	}
 
 	if maxAreaVolume <= 0 {
-		return asksVol, bidsVol, imbalance, 0
+		return actualAskNotional, actualBidNotional, imbalance, 0
 	}
 
-	vpoc := float64(bestIdx)*t.vpocProfile.BucketSize + t.vpocProfile.BucketSize/2
-	return asksVol, bidsVol, imbalance, vpoc
-}
-
-type VPOCProfile struct {
-	Buckets     map[int64]float64
-	BucketSize  float64
-	DecayFactor float64
+	vpoc := (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
+	return actualAskNotional, actualBidNotional, imbalance, vpoc
 }
 
 func (t *trader) updateTrade(trade *exchange.Trade) {

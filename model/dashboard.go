@@ -1044,7 +1044,7 @@ func dashboardOrderbookLevels(exch exchange.I, pair string, levels int) ([]excha
 	if mid <= 0 {
 		return nil, nil
 	}
-	maxDistance := mid * ((VPOC_RANGE_PCT / 2) / 100)
+	maxDistance := mid * ((ORDERBOOK_RANGE_PCT / 2) / 100)
 
 	bids := make([]exchange.Price, 0, levels)
 	for i := 0; i < levels && i < len(ob.Bids); i++ {
