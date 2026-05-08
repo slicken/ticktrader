@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const max_depth = 200
+const max_depth = 500
 
 // NewOrderbook initalizes price orderbook
 func NewOrderbook(pair string) *Orderbook {

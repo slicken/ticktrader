@@ -34,39 +34,34 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 		return
 	}
 
-	bidSize := bidPrice.Size
-	askSize := askPrice.Size
-
-	asksVol, bidsVol, volPct := t.calculateOBVolPct(ORDERBOOK_LEVEL)
-	if asksVol == 0 && bidsVol == 0 {
-		// Fallback when orderbook is unavailable: approximate volumes
-		// from top-of-book price tick sizes.
-		asksVol = askSize * ask
-		bidsVol = bidSize * bid
-		volPct = ((bidsVol - asksVol) / (bidsVol + asksVol)) * 100
-	}
-
-	vpoc := t.calculateSimpleVPOC(VPOC_ORDERBOOK_LEVEL)
-
 	t.Lock()
 	defer t.Unlock()
 
 	t.bestBid = bid
 	t.bestAsk = ask
-	t.asksVol = asksVol
-	t.bidsVol = bidsVol
-	t.volumePct = volPct
-	t.vpoc = vpoc
 	mid := (bid + ask) / 2
 	spreadPct := ((ask - bid) / mid) * 100
 	insertWithLimitInPlace(&t.Prices, [2]exchange.Price{bidPrice, askPrice}, ARRAY_SIZE)
 	insertWithLimitInPlace(&t.spreadPct, spreadPct, ARRAY_SIZE)
-	rawVolatilityPct := calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW)
-	t.volatilityPct = EMA(rawVolatilityPct, t.volatilityPct, EMA_ALPHA)
+	t.volatilityPct = EMA(calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW), t.volatilityPct, EMA_ALPHA)
 	t.volatilityRegime = volatilityRegime(t.volatilityPct)
-	rawLatencyBufferPct := calculateLatencyBufferPct(t.parent.Exchange.GetLatency(), spreadPct)
-	t.latencyBufferPct = EMA(rawLatencyBufferPct, t.latencyBufferPct, EMA_ALPHA)
+	t.latencyBufferPct = EMA(calculateLatencyBufferPct(t.parent.Exchange.GetLatency(), spreadPct), t.latencyBufferPct, EMA_ALPHA)
 	t.updateSpreadAvg()
+}
+
+// updateSpreadAvg recalculates the rolling average bid/ask spread.
+// The caller must hold t.Lock.
+func (t *trader) updateSpreadAvg() {
+	if len(t.spreadPct) == 0 {
+		t.spreadAvg = 0
+		return
+	}
+
+	var sum float64
+	for _, spread := range t.spreadPct {
+		sum += spread
+	}
+	t.spreadAvg = sum / float64(len(t.spreadPct))
 }
 
 func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
@@ -145,130 +140,96 @@ func pricePairTime(pricePair [2]exchange.Price) time.Time {
 	return pricePair[1].Time
 }
 
-// calculateOBVolPct sums top-N bid/ask sizes from the subscribed orderbook,
-// then returns notional-ish volumes (depth × top-of-book price) and imbalance
-// in percent: positive means more bid size, negative more ask size.
-func (t *trader) calculateOBVolPct(levels int) (float64, float64, float64) {
-	if t.parent == nil || t.parent.Exchange == nil || levels <= 0 {
-		return 0, 0, 0
-	}
-	ob, err := t.parent.Exchange.GetOrderbook(t.Pair)
-	if err != nil {
-		return 0, 0, 0
-	}
-	if len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-		return 0, 0, 0
+func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
+	asksVol, bidsVol, volumePct, vpoc := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
+
+	t.Lock()
+	defer t.Unlock()
+
+	t.asksVol = asksVol
+	t.bidsVol = bidsVol
+	t.volumePct = volumePct
+	t.vpoc = vpoc
+}
+
+// calculateOrderbook uses one orderbook snapshot to calculate volume
+// imbalance and update the VPOC profile.
+func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64, float64, float64, float64) {
+	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+		return 0, 0, 0, 0
 	}
 
+	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
+	if mid <= 0 {
+		return 0, 0, 0, 0
+	}
+
+	if t.vpocProfile.Buckets == nil {
+		if t.parent != nil && t.parent.Exchange != nil {
+			pair, err := t.parent.Exchange.Pair(t.Pair)
+			if err == nil && pair.Base.TickSize > 0 {
+				t.vpocProfile.Buckets = make(map[int64]float64)
+				t.vpocProfile.BucketSize = math.Max(mid*(VPOC_BUCKET_PCT/100), pair.Base.TickSize)
+				t.vpocProfile.DecayFactor = VPOC_DECAY_FACTOR
+			}
+		}
+	}
+
+	var currentIdx int64
+	vpocEnabled := t.vpocProfile.BucketSize > 0 && t.vpocProfile.Buckets != nil
+	if vpocEnabled {
+		currentIdx = int64(math.Floor(mid / t.vpocProfile.BucketSize))
+		for idx, volume := range t.vpocProfile.Buckets {
+			decay := t.vpocProfile.DecayFactor
+			if idx == currentIdx {
+				decay *= 0.3
+			}
+
+			t.vpocProfile.Buckets[idx] = volume * decay
+			if t.vpocProfile.Buckets[idx] <= 1e-12 {
+				delete(t.vpocProfile.Buckets, idx)
+			}
+		}
+	}
+
+	maxDistance := mid * ((VPOC_RANGE_PCT / 2) / 100)
 	var bidDepth, askDepth float64
-	for i := 0; i < levels && i < len(ob.Bids); i++ {
-		bidDepth += ob.Bids[i].Size
+	process := func(bookLevels []exchange.Price, addDepth func(float64)) {
+		for i := 0; i < levels && i < len(bookLevels); i++ {
+			level := bookLevels[i]
+			if level.Price <= 0 || level.Size <= 0 {
+				continue
+			}
+			if math.Abs(level.Price-mid) > maxDistance {
+				break
+			}
+
+			addDepth(level.Size)
+			if vpocEnabled {
+				idx := int64(math.Floor(level.Price / t.vpocProfile.BucketSize))
+				t.vpocProfile.Buckets[idx] += level.Size
+			}
+		}
 	}
-	for i := 0; i < levels && i < len(ob.Asks); i++ {
-		askDepth += ob.Asks[i].Size
-	}
+	process(ob.Bids, func(size float64) { bidDepth += size })
+	process(ob.Asks, func(size float64) { askDepth += size })
+
 	totalDepth := bidDepth + askDepth
 	if totalDepth == 0 {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 
 	asksVol := askDepth * ob.Asks[0].Price
 	bidsVol := bidDepth * ob.Bids[0].Price
-	imbalance := (bidDepth - askDepth) / totalDepth
-	return asksVol, bidsVol, imbalance * 100.0
-}
-
-type SimpleVPOC struct {
-	Buckets     map[int64]float64
-	BucketSize  float64
-	DecayFactor float64
-}
-
-func (t *trader) calculateSimpleVPOC(levels int) float64 {
-	// 1. Safety Checks & Orderbook Retrieval
-	if t.parent == nil || t.parent.Exchange == nil || levels <= 0 {
-		return 0
+	imbalance := ((bidDepth - askDepth) / totalDepth) * 100.0
+	if !vpocEnabled {
+		return asksVol, bidsVol, imbalance, 0
 	}
 
-	ob, err := t.parent.Exchange.GetOrderbook(t.Pair)
-	if err != nil || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-		return 0
-	}
-
-	// Calculate Mid Price
-	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
-	if mid <= 0 {
-		return 0
-	}
-
-	// 2. Initialize Struct & BucketSize
-	if t.vpocProfile.Buckets == nil {
-		pair, err := t.parent.Exchange.Pair(t.Pair)
-		if err != nil || pair.Base.TickSize <= 0 {
-			return 0
-		}
-
-		t.vpocProfile.Buckets = make(map[int64]float64)
-		t.vpocProfile.BucketSize = math.Max(mid*(VPOC_BUCKET_PCT/100), pair.Base.TickSize)
-		t.vpocProfile.DecayFactor = VPOC_DECAY_FACTOR
-	}
-
-	if t.vpocProfile.BucketSize <= 0 {
-		return 0
-	}
-
-	// Calculate current index and the 0.25% distance boundary
-	currentIdx := int64(math.Floor(mid / t.vpocProfile.BucketSize))
-	maxDistance := mid * ((VPOC_RANGE_PCT / 2) / 100)
-
-	// 3. SELECTIVE DECAY (The "Eating" Mechanism)
-	// We decay the current bucket faster to simulate price "consuming" liquidity
-	for idx, volume := range t.vpocProfile.Buckets {
-		decay := t.vpocProfile.DecayFactor
-
-		// If price is currently IN this bucket, "eat" it away 3x faster
-		if idx == currentIdx {
-			decay *= 0.3
-		}
-
-		t.vpocProfile.Buckets[idx] = volume * decay
-
-		// Clean up dust to keep the map small
-		if t.vpocProfile.Buckets[idx] <= 1e-12 {
-			delete(t.vpocProfile.Buckets, idx)
-		}
-	}
-
-	// 4. AGGREGATE (With Range Limit)
-	process := func(bookLevels []exchange.Price) {
-		for i := 0; i < levels && i < len(bookLevels); i++ {
-			level := bookLevels[i]
-
-			// Boundary Check: Ignore orders further than 0.25% from mid
-			if math.Abs(level.Price-mid) > maxDistance {
-				break // Stop early since orderbook is sorted
-			}
-
-			if level.Price <= 0 || level.Size <= 0 {
-				continue
-			}
-
-			idx := int64(math.Floor(level.Price / t.vpocProfile.BucketSize))
-			t.vpocProfile.Buckets[idx] += level.Size
-		}
-	}
-	process(ob.Bids)
-	process(ob.Asks)
-
-	// 5. SELECTION (Neighborhood Mass)
-	// We find the strongest "area" rather than a single tick to handle split clusters
 	var bestIdx int64
 	var maxAreaVolume float64
-
 	for idx, volume := range t.vpocProfile.Buckets {
-		// Sum current bucket with neighbors
 		areaVolume := volume + t.vpocProfile.Buckets[idx+1] + t.vpocProfile.Buckets[idx-1]
-
 		if areaVolume > maxAreaVolume {
 			maxAreaVolume = areaVolume
 			bestIdx = idx
@@ -276,11 +237,17 @@ func (t *trader) calculateSimpleVPOC(levels int) float64 {
 	}
 
 	if maxAreaVolume <= 0 {
-		return 0
+		return asksVol, bidsVol, imbalance, 0
 	}
 
-	// Return the center of the highest volume bucket in that neighborhood
-	return float64(bestIdx)*t.vpocProfile.BucketSize + t.vpocProfile.BucketSize/2
+	vpoc := float64(bestIdx)*t.vpocProfile.BucketSize + t.vpocProfile.BucketSize/2
+	return asksVol, bidsVol, imbalance, vpoc
+}
+
+type VPOCProfile struct {
+	Buckets     map[int64]float64
+	BucketSize  float64
+	DecayFactor float64
 }
 
 func (t *trader) updateTrade(trade *exchange.Trade) {
@@ -363,37 +330,6 @@ func (t *trader) calculateTradesInDuration(duration time.Duration) int {
 	return count
 }
 
-func (t *trader) updateBar(bar *exchange.Bar) {
-	if bar == nil {
-		return
-	}
-
-	t.Lock()
-	defer t.Unlock()
-
-	previousSMA := t.m1_SMA
-	t.updateBars(*bar)
-
-	if sma := calculateSMA(t.Bars, 20); sma > 0 {
-		t.m1_SMA = sma
-		if previousSMA > 0 {
-			t.m1_SMASlope = ((sma - previousSMA) / previousSMA) * 100
-		}
-	}
-}
-
-func (t *trader) updateBars(bar exchange.Bar) {
-	if len(t.Bars) > 0 && t.Bars[0].Time.Equal(bar.Time) {
-		t.Bars[0] = bar
-		return
-	}
-	if len(t.Bars) > 0 && bar.Time.Before(t.Bars[0].Time) {
-		return
-	}
-
-	insertWithLimitInPlace(&t.Bars, bar, ARRAY_SIZE)
-}
-
 // calculateSlippage records price impact versus mark price based on trade fills.
 // The caller must hold t.Lock.
 func (t *trader) calculateSlippage(fills []*exchange.Fill, side string) {
@@ -468,19 +404,35 @@ func (t *trader) updateSlippageAvg() {
 	t.slippageAvg = weightedSum / totalWeight
 }
 
-// updateSpreadAvg recalculates the rolling average bid/ask spread.
-// The caller must hold t.Lock.
-func (t *trader) updateSpreadAvg() {
-	if len(t.spreadPct) == 0 {
-		t.spreadAvg = 0
+func (t *trader) updateBar(bar *exchange.Bar) {
+	if bar == nil {
 		return
 	}
 
-	var sum float64
-	for _, spread := range t.spreadPct {
-		sum += spread
+	t.Lock()
+	defer t.Unlock()
+
+	previousSMA := t.m1_SMA
+	t.updateBars(*bar)
+
+	if sma := calculateSMA(t.Bars, 20); sma > 0 {
+		t.m1_SMA = sma
+		if previousSMA > 0 {
+			t.m1_SMASlope = ((sma - previousSMA) / previousSMA) * 100
+		}
 	}
-	t.spreadAvg = sum / float64(len(t.spreadPct))
+}
+
+func (t *trader) updateBars(bar exchange.Bar) {
+	if len(t.Bars) > 0 && t.Bars[0].Time.Equal(bar.Time) {
+		t.Bars[0] = bar
+		return
+	}
+	if len(t.Bars) > 0 && bar.Time.Before(t.Bars[0].Time) {
+		return
+	}
+
+	insertWithLimitInPlace(&t.Bars, bar, ARRAY_SIZE)
 }
 
 func calculateSMA(bars []exchange.Bar, length int) float64 {

@@ -14,7 +14,6 @@ import (
 
 const (
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
-	ORDERBOOK_LEVEL        = 20   // How many orderbook levels to pull/analyze when reading book data
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
 	EMA_ALPHA              = 0.1  // Smoothing factor for exponential moving average calculations
 	LATENCY_MIN_BUFFER_PCT = 0.01 // Minimum pct price buffer to account for latency when placing orders
@@ -24,10 +23,10 @@ const (
 	VOLATILITY_HIGH_PCT    = 0.02             // Threshold for "high" volatility regime, as a pct of price
 	VOLATILITY_EXTREME_PCT = 0.05             // Threshold for "extreme" volatility regime, as a pct of price
 
-	VPOC_BUCKET_PCT      = 0.002 // VPOC bucket width as percent of mid price
-	VPOC_DECAY_FACTOR    = 0.9   // Standard decay multiplier
-	VPOC_ORDERBOOK_LEVEL = 50    // Depth to scan
-	VPOC_RANGE_PCT       = 0.5   // Only consider orders within 0.25% of mid (total 0.5%)
+	ORDERBOOK_LEVEL   = 200  // How many orderbook levels to pull/analyze when reading book data
+	VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
+	VPOC_DECAY_FACTOR = 0.8  // Standard decay multiplier
+	VPOC_RANGE_PCT    = 0.5  // Only consider orders within 0.25% of mid (total 0.5%)
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -57,7 +56,7 @@ type trader struct {
 	bidsVol          float64
 	volumePct        float64
 	vpoc             float64
-	vpocProfile      SimpleVPOC
+	vpocProfile      VPOCProfile
 	volatilityPct    float64
 	volatilityRegime string
 	latencyBufferPct float64
@@ -193,7 +192,7 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		bidsVol:          0,
 		volumePct:        0,
 		vpoc:             0,
-		vpocProfile:      SimpleVPOC{DecayFactor: VPOC_DECAY_FACTOR},
+		vpocProfile:      VPOCProfile{DecayFactor: VPOC_DECAY_FACTOR},
 		volatilityPct:    0,
 		volatilityRegime: "low",
 		latencyBufferPct: 0,
@@ -229,9 +228,9 @@ func (strat *Marketmaker) Start(ctx context.Context) {
 			if t := strat.traders[bar.Pair]; t != nil {
 				t.updateBar(bar.Data)
 			}
-		case tu := <-strat.Exchange.GetTradeUpdates():
-			if t := strat.traders[tu.Pair]; t != nil {
-				t.updateTrade(tu.Data)
+		case tr := <-strat.Exchange.GetTradeUpdates():
+			if t := strat.traders[tr.Pair]; t != nil {
+				t.updateTrade(tr.Data)
 			}
 		case pd := <-strat.Exchange.GetPairUpdates():
 			if t := strat.traders[pd.Pair]; t != nil {
@@ -240,6 +239,10 @@ func (strat *Marketmaker) Start(ctx context.Context) {
 		case pr := <-strat.Exchange.GetPricesUpdates():
 			if t := strat.traders[pr.Pair]; t != nil {
 				t.updatePrices(pr.Data)
+			}
+		case ob := <-strat.Exchange.GetOrderbookUpdates():
+			if t := strat.traders[ob.Pair]; t != nil {
+				t.updateVolumes(ob.Data)
 			}
 
 		// main ticker - update using channel semaphore

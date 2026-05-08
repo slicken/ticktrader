@@ -17,6 +17,7 @@ import (
 const (
 	DASHBOARD_CHART_WINDOW     = 20 * time.Second
 	DASHBOARD_REFRESH_INTERVAL = 100 * time.Millisecond
+	SCALE_FULL_ORDERBOOK       = false
 )
 
 type Dashboard struct {
@@ -46,6 +47,7 @@ type DashboardData struct {
 type dashboardTemplateData struct {
 	ChartWindowSeconds int
 	RefreshMs          int
+	ScaleFullOrderbook bool
 }
 
 type DashboardPairData struct {
@@ -71,6 +73,8 @@ type DashboardPairData struct {
 	M1SMAPrices      []exchange.Price      `json:"m1_sma_prices"`
 	OBBidLevels      []exchange.Price      `json:"ob_bid_levels"`
 	OBAskLevels      []exchange.Price      `json:"ob_ask_levels"`
+	OBMinPrice       float64               `json:"ob_min_price"`
+	OBMaxPrice       float64               `json:"ob_max_price"`
 	Trades           []dashboardTradePoint `json:"trades"`
 }
 
@@ -200,6 +204,9 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			text-overflow: ellipsis;
 			white-space: nowrap;
 		}
+		.metric-value.compact {
+			font-size: clamp(9px, calc(9px * var(--metric-scale)), 18px);
+		}
 		.chart-panel {
 			display: flex;
 			flex-direction: column;
@@ -291,6 +298,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		const cls = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
 		const DASHBOARD_CHART_WINDOW_SECONDS = {{ .ChartWindowSeconds }};
 		const DASHBOARD_REFRESH_MS = {{ .RefreshMs }};
+		const SCALE_FULL_ORDERBOOK = {{ .ScaleFullOrderbook }};
 		let chartWindowSeconds = DASHBOARD_CHART_WINDOW_SECONDS;
 		let charts = {};
 		let renderedKeys = [];
@@ -502,6 +510,13 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
+		function compactMetric(label, value, className) {
+			return '<div class="metric">' +
+				'<div class="metric-label">' + label + '</div>' +
+				'<div class="metric-value compact ' + (className || 'neutral') + '">' + value + '</div>' +
+			'</div>';
+		}
+
 		function volatilityRegimeClass(regime) {
 			return 'regime-' + (regime || 'low');
 		}
@@ -515,6 +530,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				metric('Mark Price', fmtPrice(row.mark_price, digits)) +
 				metric('Mid Price', fmtPrice(row.mid_price, digits)) +
 				metric('VPOC', fmtPrice(row.vpoc, digits)) +
+				compactMetric('OB Window', fmtPrice(row.ob_min_price, digits) + ' / ' + fmtPrice(row.ob_max_price, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imb', pct(row.volume_pct), cls(row.volume_pct)) +
 				metric('Spread Avg', pct(row.spread_avg), cls(row.spread_avg)) +
@@ -608,15 +624,20 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[5].pointRadius = tradeRadii;
 			chart.data.datasets[5].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
 			chart.data.datasets[5].label = 'trades';
-			setPriceScale(chart, bids, asks, marks, tradeAlign.prices);
+			setPriceScale(chart, bids, asks, marks, tradeAlign.prices, row.ob_bid_levels || [], row.ob_ask_levels || []);
 			chart.update('none');
 			renderOrderbookDepth(i, chart, row.ob_bid_levels || [], row.ob_ask_levels || []);
 		}
 
-		function setPriceScale(chart, bids, asks, marks, tradePrices) {
+		function setPriceScale(chart, bids, asks, marks, tradePrices, bidLevels, askLevels) {
+			const orderbookPrices = (bidLevels || [])
+				.concat(askLevels || [])
+				.map(level => level.Price)
+				.filter(price => price > 0);
 			const prices = bids.concat(asks, marks)
 				.map(price => price.Price)
 				.concat((tradePrices || []).filter(price => Number.isFinite(price)))
+				.concat(SCALE_FULL_ORDERBOOK ? orderbookPrices : [])
 				.filter(price => price > 0);
 
 			if (prices.length === 0) {
@@ -627,7 +648,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
 			const min = Math.min(...prices);
 			const max = Math.max(...prices);
-			const padding = Math.max((max - min) * 0.08, max * 0.0001);
+			const padding = SCALE_FULL_ORDERBOOK && orderbookPrices.length > 0 ? 0 : Math.max((max - min) * 0.08, max * 0.0001);
 			chart.options.scales.y.min = min - padding;
 			chart.options.scales.y.max = max + padding;
 		}
@@ -644,60 +665,57 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				return;
 			}
 			const yScale = chart.scales.y;
-			const depthLevels = 10;
-			const bidsTop = (bidLevels || []).slice(0, depthLevels);
-			const asksTop = (askLevels || []).slice(0, depthLevels);
-			let bidCum = 0;
+			const bidsTop = bidLevels || [];
+			const asksTop = askLevels || [];
 			const bidSteps = [];
 			for (const level of bidsTop) {
 				const notional = (level?.Price || 0) * (level?.Size || 0);
 				if (!(notional > 0) || !(level?.Price > 0)) {
 					continue;
 				}
-				bidCum += notional;
-				bidSteps.push({ price: level.Price, cum: bidCum });
+				const y = yScale.getPixelForValue(level.Price);
+				if (!Number.isFinite(y) || y < chartArea.top || y > chartArea.bottom) {
+					continue;
+				}
+				bidSteps.push({ y, notional });
 			}
-			let askCum = 0;
 			const askSteps = [];
 			for (const level of asksTop) {
 				const notional = (level?.Price || 0) * (level?.Size || 0);
 				if (!(notional > 0) || !(level?.Price > 0)) {
 					continue;
 				}
-				askCum += notional;
-				askSteps.push({ price: level.Price, cum: askCum });
+				const y = yScale.getPixelForValue(level.Price);
+				if (!Number.isFinite(y) || y < chartArea.top || y > chartArea.bottom) {
+					continue;
+				}
+				askSteps.push({ y, notional });
 			}
 
-			const maxCum = Math.max(bidCum, askCum);
-			if (!(maxCum > 0)) {
+			const totalNotional = bidSteps
+				.concat(askSteps)
+				.reduce((total, step) => total + step.notional, 0);
+			if (!(totalNotional > 0)) {
 				return;
 			}
 
-			// Keep top levels visible even when some book prices fall outside chart y-range.
-			// We anchor at best bid/ask y and compress remaining levels within available space.
-			const bestBidYRaw = bidSteps.length > 0 ? yScale.getPixelForValue(bidSteps[0].price) : chartArea.bottom;
-			const bestAskYRaw = askSteps.length > 0 ? yScale.getPixelForValue(askSteps[0].price) : chartArea.top;
-			const bestBidY = Math.min(chartArea.bottom, Math.max(chartArea.top, Number.isFinite(bestBidYRaw) ? bestBidYRaw : chartArea.bottom));
-			const bestAskY = Math.min(chartArea.bottom, Math.max(chartArea.top, Number.isFinite(bestAskYRaw) ? bestAskYRaw : chartArea.top));
-			const bidStepPx = bidSteps.length > 1 ? Math.max(4, (chartArea.bottom - bestBidY) / (bidSteps.length - 1)) : 0;
-			const askStepPx = askSteps.length > 1 ? Math.max(4, (bestAskY - chartArea.top) / (askSteps.length - 1)) : 0;
-
-			const draw = (steps, cls, startY, stepPx, direction) => {
+			const draw = (steps, cls) => {
+				let cumulative = 0;
 				for (let i = 0; i < steps.length; i++) {
 					const step = steps[i];
-					let y = startY + direction*stepPx*i;
-					y = Math.min(chartArea.bottom, Math.max(chartArea.top, y));
-					const widthPct = Math.max(4, Math.round((step.cum / maxCum) * 95));
+					cumulative += step.notional;
+					const widthPct = Math.min(95, Math.max(2, (cumulative / totalNotional) * 95));
 					const el = document.createElement('div');
 					el.className = 'depth-level ' + cls;
 					el.style.width = widthPct + '%';
-					el.style.top = Math.round(y - 10) + 'px';
+					const top = Math.min(chartArea.bottom - 20, Math.max(chartArea.top, step.y - 10));
+					el.style.top = Math.round(top) + 'px';
 					overlay.appendChild(el);
 				}
 			};
 
-			draw(bidSteps, 'depth-bid', bestBidY, bidStepPx, 1);
-			draw(askSteps, 'depth-ask', bestAskY, askStepPx, -1);
+			draw(bidSteps, 'depth-bid');
+			draw(askSteps, 'depth-ask');
 		}
 
 		function alignSeriesToPrices(prices, series) {
@@ -828,6 +846,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	data := dashboardTemplateData{
 		ChartWindowSeconds: int(DASHBOARD_CHART_WINDOW / time.Second),
 		RefreshMs:          int(DASHBOARD_REFRESH_INTERVAL / time.Millisecond),
+		ScaleFullOrderbook: SCALE_FULL_ORDERBOOK,
 	}
 	if err := template.Must(template.New("dashboard").Parse(tmpl)).Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -872,7 +891,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			continue
 		}
 
-		obBids, obAsks := dashboardOrderbookLevels(strat.Exchange, pair, 20)
+		obBids, obAsks := dashboardOrderbookLevels(strat.Exchange, pair, ORDERBOOK_LEVEL)
+		obMinPrice, obMaxPrice := orderbookPriceWindow(obBids, obAsks)
 		pairInfo, _ := strat.Exchange.Pair(pair)
 		priceDecimals := tickSizeDecimals(pairInfo.Base.TickSize)
 
@@ -907,6 +927,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			M1SMAPrices:      dashboardPricePoint(t.m1_SMA, sampleTime),
 			OBBidLevels:      obBids,
 			OBAskLevels:      obAsks,
+			OBMinPrice:       obMinPrice,
+			OBMaxPrice:       obMaxPrice,
 			Trades:           tradePricePoints(t.Trades),
 		}
 		t.RUnlock()
@@ -967,11 +989,20 @@ func dashboardOrderbookLevels(exch exchange.I, pair string, levels int) ([]excha
 		return nil, nil
 	}
 
+	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
+	if mid <= 0 {
+		return nil, nil
+	}
+	maxDistance := mid * ((VPOC_RANGE_PCT / 2) / 100)
+
 	bids := make([]exchange.Price, 0, levels)
 	for i := 0; i < levels && i < len(ob.Bids); i++ {
 		level := ob.Bids[i]
 		if level.Price <= 0 || level.Size <= 0 {
 			continue
+		}
+		if math.Abs(level.Price-mid) > maxDistance {
+			break
 		}
 		bids = append(bids, level)
 	}
@@ -981,9 +1012,35 @@ func dashboardOrderbookLevels(exch exchange.I, pair string, levels int) ([]excha
 		if level.Price <= 0 || level.Size <= 0 {
 			continue
 		}
+		if math.Abs(level.Price-mid) > maxDistance {
+			break
+		}
 		asks = append(asks, level)
 	}
 	return bids, asks
+}
+
+func orderbookPriceWindow(bids, asks []exchange.Price) (float64, float64) {
+	minPrice := 0.0
+	maxPrice := 0.0
+	update := func(price float64) {
+		if price <= 0 {
+			return
+		}
+		if minPrice == 0 || price < minPrice {
+			minPrice = price
+		}
+		if price > maxPrice {
+			maxPrice = price
+		}
+	}
+	for _, level := range bids {
+		update(level.Price)
+	}
+	for _, level := range asks {
+		update(level.Price)
+	}
+	return minPrice, maxPrice
 }
 
 func rowKey(row DashboardPairData) string {
@@ -1267,9 +1324,21 @@ func tradePricePoint(trade exchange.Trade) (dashboardTradePoint, bool) {
 		ts = trade.Order.Time
 		side = strings.ToLower(trade.Order.Side)
 	}
+	if side != "buy" && side != "sell" {
+		for _, fill := range trade.Fills {
+			if fill != nil {
+				side = strings.ToLower(fill.Side)
+				if side == "buy" || side == "sell" {
+					break
+				}
+			}
+		}
+	}
+	if side != "buy" && side != "sell" {
+		return dashboardTradePoint{}, false
+	}
 
 	if len(trade.Fills) > 0 {
-		var weightedPrice float64
 		var totalSize float64
 		var firstFillPrice float64
 		for _, fill := range trade.Fills {
@@ -1279,14 +1348,10 @@ func tradePricePoint(trade exchange.Trade) (dashboardTradePoint, bool) {
 			if ts.IsZero() {
 				ts = fill.Time
 			}
-			if side == "" {
-				side = strings.ToLower(fill.Side)
-			}
 			if firstFillPrice == 0 {
 				firstFillPrice = fill.Price
 			}
 			totalSize += fill.Size
-			weightedPrice += fill.Price * fill.Size
 			switch side {
 			case "buy":
 				if fill.Price > endPrice {
@@ -1302,18 +1367,12 @@ func tradePricePoint(trade exchange.Trade) (dashboardTradePoint, bool) {
 			if startPrice <= 0 {
 				startPrice = firstFillPrice
 			}
-			if endPrice <= 0 {
-				endPrice = weightedPrice / totalSize
-			}
 			size = totalSize
 		}
 	}
 
 	if startPrice <= 0 {
 		startPrice = endPrice
-	}
-	if endPrice <= 0 {
-		endPrice = startPrice
 	}
 	if endPrice <= 0 {
 		return dashboardTradePoint{}, false
