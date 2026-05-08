@@ -26,10 +26,10 @@ const (
 	VOLATILITY_EXTREME_PCT = 0.05             // Threshold for "extreme" volatility regime, as a pct of price
 
 	ORDERBOOK_LEVEL             = 200  // How many orderbook levels to pull/analyze when reading book data
-	ORDERBOOK_WEIGHT_FACTOR     = 1.7  // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
+	ORDERBOOK_WEIGHT_FACTOR     = 8.0  // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
 	ORDERBOOK_RANGE_PCT         = 0.5  // Only analyse orders within this/2 percent range from mid
 	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
-	ORDERBOOK_VPOC_DECAY_FACTOR = 0.7  // Standard decay multiplier
+	ORDERBOOK_VPOC_DECAY_FACTOR = 0.9  // Standard decay multiplier
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -156,7 +156,6 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 	wg.Wait()
 
 	log.Printf("Subscribed to %d pairs... (%d subscriptions)\n", len(pairs), count.Load())
-	log.Printf("%v\n", pairs)
 
 	return strat
 }
