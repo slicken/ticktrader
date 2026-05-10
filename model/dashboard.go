@@ -57,6 +57,7 @@ type DashboardPairData struct {
 	MarkPrice        float64               `json:"mark_price"`
 	MidPrice         float64               `json:"mid_price"`
 	SpreadAvg        float64               `json:"spread_avg"`
+	SpreadRegime     string                `json:"spread_regime"`
 	SlippageAvg      float64               `json:"slippage_avg"`
 	VPOC             float64               `json:"vpoc"`
 	VolumePct        float64               `json:"volume_pct"`
@@ -196,6 +197,12 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			text-transform: uppercase;
 			margin-bottom: clamp(2px, calc(2px * var(--metric-scale)), 5px);
 		}
+		.metric-label-row {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+		}
 		.metric-value {
 			font-size: clamp(11px, calc(12px * var(--metric-scale)), 28px);
 			font-weight: 700;
@@ -231,6 +238,21 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			pointer-events: none;
 			white-space: nowrap;
 		}
+		.regime-legend {
+			display: inline-flex;
+			gap: 3px;
+			flex: 0 0 auto;
+		}
+		.regime-chip {
+			width: 8px;
+			height: 8px;
+			border-radius: 2px;
+			opacity: 0.9;
+		}
+		.regime-chip.regime-low { background: #4ade80; }
+		.regime-chip.regime-normal { background: #d1d5db; }
+		.regime-chip.regime-high { background: #facc15; }
+		.regime-chip.regime-extreme { background: #f87171; }
 		.depth-overlay {
 			position: absolute;
 			top: 0;
@@ -538,8 +560,24 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
-		function volatilityRegimeClass(regime) {
+		function regimeMetric(label, value, regime) {
+			return '<div class="metric">' +
+				'<div class="metric-label metric-label-row"><span>' + label + '</span>' + regimeLegendHtml() + '</div>' +
+				'<div class="metric-value ' + regimeClass(regime) + '">' + value + '</div>' +
+			'</div>';
+		}
+
+		function regimeClass(regime) {
 			return 'regime-' + (regime || 'low');
+		}
+
+		function regimeLegendHtml() {
+			return '<span class="regime-legend">' +
+				'<span class="regime-chip regime-low"></span>' +
+				'<span class="regime-chip regime-normal"></span>' +
+				'<span class="regime-chip regime-high"></span>' +
+				'<span class="regime-chip regime-extreme"></span>' +
+			'</span>';
 		}
 
 		function metricsHtml(row) {
@@ -552,10 +590,9 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				compactMetric('OB Window', fmtPrice(row.ob_min_price, digits) + ' / ' + fmtPrice(row.ob_max_price, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imb', pct(row.volume_pct), cls(row.volume_pct)) +
-				metric('Spread Avg', pct(row.spread_avg), cls(row.spread_avg)) +
+				regimeMetric('Spread Avg', pct(row.spread_avg), row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
-				metric('Vol 10s', pct(row.volatility_pct), cls(row.volatility_pct)) +
-				metric('Vol Regime', row.volatility_regime || 'low', volatilityRegimeClass(row.volatility_regime)) +
+				regimeMetric('Vol 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
 				metric('m1_SMA', fmtPrice(row.m1_sma, digits)) +
@@ -687,15 +724,15 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			const chartHeight = measuredChartHeightPx(chart);
 			const canvasHeight = chart?.canvas?.clientHeight || chart?.height || chartHeight;
 			if (!(chartHeight > 0) || !(canvasHeight > 0)) {
-				return 20;
+				return 10;
 			}
 
 			const fullSizeChartHeight = chartHeight * (chartRowHeightPx(1) / canvasHeight);
 			if (!(fullSizeChartHeight > 0)) {
-				return 20;
+				return 10;
 			}
 
-			return Math.round(clamp(4, 20 * (chartHeight / fullSizeChartHeight), 20));
+			return Math.round(clamp(2, 10 * (chartHeight / fullSizeChartHeight), 10));
 		}
 
 		function renderOrderbookDepth(index, chart, bidLevels, askLevels) {
@@ -962,6 +999,7 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			MarkPrice:        t.MarkPrice,
 			MidPrice:         midPrice,
 			SpreadAvg:        t.spreadAvg,
+			SpreadRegime:     t.spreadRegime,
 			SlippageAvg:      t.slippageAvg,
 			VPOC:             t.vpoc,
 			VolumePct:        t.volumePct,

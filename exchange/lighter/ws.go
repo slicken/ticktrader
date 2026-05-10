@@ -190,13 +190,6 @@ func (e *Lighter) handleRawTicker(symbol string, data []byte) error {
 		{Price: parseFloatDefault(msg.Ticker.Ask.Price, 0), Size: parseFloatDefault(msg.Ticker.Ask.Size, 0), Time: now},
 	}
 
-	e.Lock()
-	if pairData := e.Pairs[symbol]; pairData != nil && prices[0].Price > 0 && prices[1].Price > 0 {
-		pairData.Price = (prices[0].Price + prices[1].Price) / 2
-		pairData.MarkPrice = pairData.Price
-	}
-	e.Unlock()
-
 	select {
 	case e.Notifications.Prices <- exchange.ExchangeUpdate[*[]exchange.Price]{Pair: symbol, Type: "prices", Data: &prices}:
 	default:
@@ -260,7 +253,7 @@ func (e *Lighter) handleRawMarketStats(symbol string, data []byte) error {
 		if price, ok := parseFloat(firstNonEmpty(msg.MarketStats.LastTradePrice, msg.MarketStats.MidPrice)); ok {
 			pairData.Price = price
 		}
-		if markPrice, ok := parseFloat(firstNonEmpty(msg.MarketStats.MarkPrice, msg.MarketStats.MidPrice)); ok {
+		if markPrice, ok := parseFloat(msg.MarketStats.MarkPrice); ok {
 			pairData.MarkPrice = markPrice
 		}
 		if openInterest, ok := parseFloat(msg.MarketStats.OpenInterest); ok {

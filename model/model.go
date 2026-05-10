@@ -17,13 +17,17 @@ const (
 
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
-	EMA_ALPHA              = 0.1  // Smoothing factor for exponential moving average calculations
+	EMA_ALPHA              = 0.05 // Smoothing factor for exponential moving average calculations
 	LATENCY_MIN_BUFFER_PCT = 0.01 // Minimum pct price buffer to account for latency when placing orders
 
 	VOLATILITY_WINDOW      = 10 * time.Second // Lookback window for realized volatility calculation
 	VOLATILITY_LOW_PCT     = 0.003            // Threshold for "low" volatility regime, as a pct of price
 	VOLATILITY_HIGH_PCT    = 0.02             // Threshold for "high" volatility regime, as a pct of price
 	VOLATILITY_EXTREME_PCT = 0.05             // Threshold for "extreme" volatility regime, as a pct of price
+
+	SPREAD_LOW_PCT     = 0.005 // Threshold for "low" spread regime, as a pct of price
+	SPREAD_HIGH_PCT    = 0.02  // Threshold for "high" spread regime, as a pct of price
+	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
 
 	ORDERBOOK_LEVEL             = 200  // How many orderbook levels to pull/analyze when reading book data
 	ORDERBOOK_WEIGHT_FACTOR     = 8.0  // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
@@ -51,6 +55,7 @@ type trader struct {
 	slippageAvg      float64
 	spreadPct        []float64
 	spreadAvg        float64
+	spreadRegime     string
 	MarkPrice        float64
 	Price            float64
 	bestBid          float64
@@ -172,6 +177,7 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		slippageAvg:      0,
 		spreadPct:        make([]float64, 0, ARRAY_SIZE),
 		spreadAvg:        0,
+		spreadRegime:     "low",
 		MarkPrice:        0,
 		Price:            0,
 		bestBid:          0,
@@ -224,6 +230,8 @@ func (strat *Marketmaker) Start(ctx context.Context) {
 			if t := strat.traders[pd.Pair]; t != nil {
 				t.updatePair(pd.Data)
 			}
+		case pu := <-strat.Exchange.GetPositionUpdates():
+			strat.closeInstantProfitPosition(pu.Data)
 		case pr := <-strat.Exchange.GetPricesUpdates():
 			if t := strat.traders[pr.Pair]; t != nil {
 				t.updatePrices(pr.Data)
@@ -297,6 +305,51 @@ func (strat *Marketmaker) Stop() {
 }
 
 func (strat *Marketmaker) update() {
+}
+
+func (strat *Marketmaker) closeInstantProfitPosition(pos *exchange.Position) {
+	if pos == nil || pos.Size == 0 || pos.PNL <= 0 {
+		return
+	}
+	if strat.traders[pos.Pair] == nil {
+		return
+	}
+
+	if strat.hasReduceOnlyCloseOrder(pos.Pair, pos.Size) {
+		return
+	}
+
+	side := "sell"
+	if pos.Size < 0 {
+		side = "buy"
+	}
+	order := exchange.Order{
+		Pair:       pos.Pair,
+		Side:       side,
+		Type:       "market",
+		Size:       math.Abs(pos.Size),
+		Price:      0,
+		ReduceOnly: true,
+	}
+
+	if err := strat.Exchange.PlaceOrders([]exchange.Order{order}); err != nil {
+		log.Printf("instant close: failed closing profitable %s position %.6f PnL $%+.2f: %v", pos.Pair, pos.Size, pos.PNL, err)
+		return
+	}
+	log.Printf("instant close: %s %s %.6f profitable position PnL $%+.2f", pos.Pair, side, order.Size, pos.PNL)
+}
+
+func (strat *Marketmaker) hasReduceOnlyCloseOrder(pair string, positionSize float64) bool {
+	closeSide := "sell"
+	if positionSize < 0 {
+		closeSide = "buy"
+	}
+	for _, order := range strat.Exchange.GetOrders() {
+		if order.Pair == pair && order.ReduceOnly && order.Side == closeSide && order.Status != "filled" && order.Status != "canceled" {
+			return true
+		}
+	}
+	return false
 }
 
 func (strat *Marketmaker) getInitialBars(pair string) error {

@@ -206,7 +206,6 @@ func (e *Lighter) loadAssetsAndPairs() error {
 		pair := &exchange.Pair{
 			Name:            symbol,
 			Price:           detail.LastTradePrice,
-			MarkPrice:       detail.LastTradePrice,
 			Base:            *asset,
 			Quote:           quote,
 			Enabled:         true,
@@ -739,12 +738,6 @@ func (e *Lighter) handleOrderbook(pair string, resp lighterapi.LighterOrderBookR
 	ob.LastUpdated = now
 	snapshot := ob.Clone()
 
-	if pairData := e.Pairs[pair]; pairData != nil {
-		if len(ob.Bids) > 0 && len(ob.Asks) > 0 {
-			pairData.Price = (ob.Bids[0].Price + ob.Asks[0].Price) / 2
-			pairData.MarkPrice = pairData.Price
-		}
-	}
 	e.Unlock()
 
 	select {

@@ -126,7 +126,6 @@ type I interface {
 	PlaceOrders([]Order) error                                // USER IMPLEMENTATION: places new orders
 	ModifyOrders([]Order) error                               // USER IMPLEMENTATION: modifies existing orders
 	CancelOrders([]Order) error                               // USER IMPLEMENTATION: cancels orders
-	// Subscribe to live events.
 	// All Subscribe* methods except SubscribeBars must be backed by websocket streams.
 	// If a venue does not support a websocket stream for the requested data, return an error.
 	// SubscribeBars may use REST polling only when the venue has no websocket candle stream.
