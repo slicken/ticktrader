@@ -33,8 +33,7 @@ const (
 	ORDERBOOK_LEVEL             = 200   // How many orderbook levels to pull/analyze when reading book data
 	ORDERBOOK_RANGE_PCT         = 0.5   // Only analyse orders within this/2 percent range from mid
 	ORDERBOOK_WEIGHT_FACTOR     = 8.0   // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
-	ORDERBOOK_NEAR_RANGE_PCT    = 0.025 // How far from best bid/ask to analyze near-book volume, as a pct of price
-	ORDERBOOK_NEAR_STRENGTH_REF = 2.5   // Current near volume must be this multiple of average near volume to score 100%
+	ORDERBOOK_NEAR_RANGE_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
 	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
 	ORDERBOOK_VPOC_DECAY_FACTOR = 0.9   // Standard decay multiplier
 )

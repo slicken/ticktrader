@@ -608,10 +608,10 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				'<div class="symbol">' + row.symbol + '</div>' +
 			'</div>' +
 			'<div class="metric-grid">' +
-				metric('VPOC', fmtPrice(row.vpoc, digits)) +
-				compactMetric('Orderbook Range ' + ORDERBOOK_RANGE_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
+				compactMetric('OB Range ' + ORDERBOOK_RANGE_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
+				metric('OB VPOC', fmtPrice(row.vpoc, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
-				metric('Volume Imb', pct(row.volume_pct), cls(row.volume_pct)) +
+				metric('Volume Imbalance', pct(row.volume_pct), cls(row.volume_pct)) +
 				metric('Volume Near', pct(row.near_volume), cls(row.near_volume)) +
 				regimeMetric('Spread Avg', pct(row.spread_avg), row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +

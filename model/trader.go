@@ -306,7 +306,7 @@ func calculateNearVolumeStrength(bidNearNotional, askNearNotional, averageNearNo
 		return 0
 	}
 	strongest := math.Max(bidNearNotional, askNearNotional)
-	strength := math.Min(strongest/(averageNearNotional*ORDERBOOK_NEAR_STRENGTH_REF), 1) * 100
+	strength := (strongest / averageNearNotional) * 100
 	if askNearNotional > bidNearNotional {
 		return -strength
 	}
