@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	DASHBOARD_CHART_WINDOW     = 20 * time.Second
-	DASHBOARD_REFRESH_INTERVAL = 100 * time.Millisecond
-	SCALE_FULL_ORDERBOOK       = false
+	DASHBOARD_CHART_WINDOW     = 20 * time.Second       // chart window duration
+	DASHBOARD_REFRESH_INTERVAL = 100 * time.Millisecond // interval between dashboard refreshes
+	CHART_SCALE_RATIO          = 0.0                    // scale ratio for charts (0.0 = no scaling, 1.0 = full scaling)
 )
 
 type Dashboard struct {
@@ -47,7 +47,8 @@ type DashboardData struct {
 type dashboardTemplateData struct {
 	ChartWindowSeconds int
 	RefreshMs          int
-	ScaleFullOrderbook bool
+	ChartScaleRatio    float64
+	NearRangePct       float64
 }
 
 type DashboardPairData struct {
@@ -61,6 +62,7 @@ type DashboardPairData struct {
 	SlippageAvg      float64               `json:"slippage_avg"`
 	VPOC             float64               `json:"vpoc"`
 	VolumePct        float64               `json:"volume_pct"`
+	NearVolume       float64               `json:"near_volume"`
 	VolatilityPct    float64               `json:"volatility_pct"`
 	VolatilityRegime string                `json:"volatility_regime"`
 	TradesPerMinute  int                   `json:"trades_per_minute"`
@@ -283,6 +285,24 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		.depth-ask {
 			background: rgba(248, 113, 113, 0.3);
 		}
+		.near-marker {
+			position: absolute;
+			right: 14px;
+			width: 38px;
+			height: 0;
+			border-top: 2px solid;
+			opacity: 0.9;
+		}
+		.near-marker-boundary {
+			border-top-style: dashed;
+			opacity: 0.65;
+		}
+		.near-marker-bid {
+			border-color: #4ade80;
+		}
+		.near-marker-ask {
+			border-color: #f87171;
+		}
 		.positive { color: #4ade80; }
 		.negative { color: #f87171; }
 		.neutral { color: #d1d5db; }
@@ -318,7 +338,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		const cls = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
 		const DASHBOARD_CHART_WINDOW_SECONDS = {{ .ChartWindowSeconds }};
 		const DASHBOARD_REFRESH_MS = {{ .RefreshMs }};
-		const SCALE_FULL_ORDERBOOK = {{ .ScaleFullOrderbook }};
+		const CHART_SCALE_RATIO = {{ .ChartScaleRatio }};
+		const ORDERBOOK_NEAR_RANGE_PCT = {{ .NearRangePct }};
 		let chartWindowSeconds = DASHBOARD_CHART_WINDOW_SECONDS;
 		let charts = {};
 		let renderedKeys = [];
@@ -590,6 +611,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				compactMetric('OB Window', fmtPrice(row.ob_min_price, digits) + ' / ' + fmtPrice(row.ob_max_price, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imb', pct(row.volume_pct), cls(row.volume_pct)) +
+				metric('Volume Near', pct(row.near_volume), cls(row.near_volume)) +
 				regimeMetric('Spread Avg', pct(row.spread_avg), row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
 				regimeMetric('Vol 10s', pct(row.volatility_pct), row.volatility_regime) +
@@ -691,7 +713,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			const prices = bids.concat(asks, marks)
 				.map(price => price.Price)
 				.concat((tradePrices || []).filter(price => Number.isFinite(price)))
-				.concat(SCALE_FULL_ORDERBOOK ? orderbookPrices : [])
 				.filter(price => price > 0);
 
 			if (prices.length === 0) {
@@ -700,9 +721,18 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				return;
 			}
 
-			const min = Math.min(...prices);
-			const max = Math.max(...prices);
-			const padding = SCALE_FULL_ORDERBOOK && orderbookPrices.length > 0 ? 0 : Math.max((max - min) * 0.08, max * 0.0001);
+			const priceMin = Math.min(...prices);
+			const priceMax = Math.max(...prices);
+			const ratio = Math.max(0, Math.min(1, CHART_SCALE_RATIO));
+			let min = priceMin;
+			let max = priceMax;
+			if (ratio > 0 && orderbookPrices.length > 0) {
+				const obMin = Math.min(...orderbookPrices);
+				const obMax = Math.max(...orderbookPrices);
+				min = priceMin - Math.max(0, priceMin - obMin) * ratio;
+				max = priceMax + Math.max(0, obMax - priceMax) * ratio;
+			}
+			const padding = ratio >= 1 && orderbookPrices.length > 0 ? 0 : Math.max((max - min) * 0.08, max * 0.0001);
 			chart.options.scales.y.min = min - padding;
 			chart.options.scales.y.max = max + padding;
 		}
@@ -774,6 +804,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				askSteps.push({ y, notional });
 			}
 
+			drawNearVolumeMarkers(overlay, yScale, chartArea, bidsTop, asksTop);
+
 			const totalNotional = bidSteps
 				.concat(askSteps)
 				.reduce((total, step) => total + step.notional, 0);
@@ -800,6 +832,33 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
 			draw(bidSteps, 'depth-bid');
 			draw(askSteps, 'depth-ask');
+		}
+
+		function drawNearVolumeMarkers(overlay, yScale, chartArea, bidLevels, askLevels) {
+			const bestBid = bidLevels?.[0]?.Price || 0;
+			const bestAsk = askLevels?.[0]?.Price || 0;
+			const depthRatio = ORDERBOOK_NEAR_RANGE_PCT / 100;
+			if (!(bestBid > 0) || !(bestAsk > 0) || !(depthRatio > 0)) {
+				return;
+			}
+
+			const markers = [
+				{ price: bestBid, cls: 'near-marker-bid' },
+				{ price: bestBid * (1 - depthRatio), cls: 'near-marker-bid near-marker-boundary' },
+				{ price: bestAsk, cls: 'near-marker-ask' },
+				{ price: bestAsk * (1 + depthRatio), cls: 'near-marker-ask near-marker-boundary' },
+			];
+
+			for (const marker of markers) {
+				const y = yScale.getPixelForValue(marker.price);
+				if (!Number.isFinite(y) || y < chartArea.top || y > chartArea.bottom) {
+					continue;
+				}
+				const el = document.createElement('div');
+				el.className = 'near-marker ' + marker.cls;
+				el.style.top = Math.round(y) + 'px';
+				overlay.appendChild(el);
+			}
 		}
 
 		function alignSeriesToPrices(prices, series) {
@@ -934,7 +993,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	data := dashboardTemplateData{
 		ChartWindowSeconds: int(DASHBOARD_CHART_WINDOW / time.Second),
 		RefreshMs:          int(DASHBOARD_REFRESH_INTERVAL / time.Millisecond),
-		ScaleFullOrderbook: SCALE_FULL_ORDERBOOK,
+		ChartScaleRatio:    CHART_SCALE_RATIO,
+		NearRangePct:       ORDERBOOK_NEAR_RANGE_PCT,
 	}
 	if err := template.Must(template.New("dashboard").Parse(tmpl)).Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1003,6 +1063,7 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			SlippageAvg:      t.slippageAvg,
 			VPOC:             t.vpoc,
 			VolumePct:        t.volumePct,
+			NearVolume:       t.nearVolumeStrength,
 			VolatilityPct:    t.volatilityPct,
 			VolatilityRegime: t.volatilityRegime,
 			TradesPerMinute:  t.tradePerMinute,

@@ -18,6 +18,7 @@ const (
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
 	EMA_ALPHA              = 0.05 // Smoothing factor for exponential moving average calculations
+	EMA_ALPHA_SLOW         = 0.01 // Slower smoothing factor for baseline/regime calculations
 	LATENCY_MIN_BUFFER_PCT = 0.01 // Minimum pct price buffer to account for latency when placing orders
 
 	VOLATILITY_WINDOW      = 10 * time.Second // Lookback window for realized volatility calculation
@@ -29,11 +30,13 @@ const (
 	SPREAD_HIGH_PCT    = 0.02  // Threshold for "high" spread regime, as a pct of price
 	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
 
-	ORDERBOOK_LEVEL             = 200  // How many orderbook levels to pull/analyze when reading book data
-	ORDERBOOK_WEIGHT_FACTOR     = 8.0  // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
-	ORDERBOOK_RANGE_PCT         = 0.5  // Only analyse orders within this/2 percent range from mid
-	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
-	ORDERBOOK_VPOC_DECAY_FACTOR = 0.9  // Standard decay multiplier
+	ORDERBOOK_LEVEL             = 200   // How many orderbook levels to pull/analyze when reading book data
+	ORDERBOOK_RANGE_PCT         = 0.5   // Only analyse orders within this/2 percent range from mid
+	ORDERBOOK_WEIGHT_FACTOR     = 8.0   // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
+	ORDERBOOK_NEAR_RANGE_PCT    = 0.025 // How far from best bid/ask to analyze near-book volume, as a pct of price
+	ORDERBOOK_NEAR_STRENGTH_REF = 2.5   // Current near volume must be this multiple of average near volume to score 100%
+	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
+	ORDERBOOK_VPOC_DECAY_FACTOR = 0.9   // Standard decay multiplier
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -46,34 +49,36 @@ type Marketmaker struct {
 
 // trader is a pair-specific tradingg instance with its own world/settings
 type trader struct {
-	parent           *Marketmaker
-	Pair             string
-	Bars             []exchange.Bar
-	Trades           []exchange.Trade
-	Prices           [][2]exchange.Price
-	slippagePct      []float64
-	slippageAvg      float64
-	spreadPct        []float64
-	spreadAvg        float64
-	spreadRegime     string
-	MarkPrice        float64
-	Price            float64
-	bestBid          float64
-	bestAsk          float64
-	asksVol          float64
-	bidsVol          float64
-	volumePct        float64
-	vpoc             float64
-	vpocProfile      VPOCProfile
-	volatilityPct    float64
-	volatilityRegime string
-	latencyBufferPct float64
-	tradePerMinute   int
-	lastTradePrice   float64
-	openInterest     float64
-	fundingRate      float64
-	m1_SMA           float64
-	m1_SMASlope      float64
+	parent             *Marketmaker
+	Pair               string
+	Bars               []exchange.Bar
+	Trades             []exchange.Trade
+	Prices             [][2]exchange.Price
+	slippagePct        []float64
+	slippageAvg        float64
+	spreadPct          []float64
+	spreadAvg          float64
+	spreadRegime       string
+	MarkPrice          float64
+	Price              float64
+	bestBid            float64
+	bestAsk            float64
+	asksVol            float64
+	bidsVol            float64
+	volumePct          float64
+	nearVolumeStrength float64
+	nearVolumeAvg      float64
+	vpoc               float64
+	vpocProfile        VPOCProfile
+	volatilityPct      float64
+	volatilityRegime   string
+	latencyBufferPct   float64
+	tradePerMinute     int
+	lastTradePrice     float64
+	openInterest       float64
+	fundingRate        float64
+	m1_SMA             float64
+	m1_SMASlope        float64
 	sync.RWMutex
 }
 
@@ -168,34 +173,36 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 // Newtrader creates a new pair-specific trading instance
 func Newtrader(parent *Marketmaker, pair string) *trader {
 	return &trader{
-		parent:           parent,
-		Pair:             pair,
-		Bars:             make([]exchange.Bar, 0, ARRAY_SIZE),
-		Trades:           make([]exchange.Trade, 0, ARRAY_SIZE),
-		Prices:           make([][2]exchange.Price, 0, ARRAY_SIZE),
-		slippagePct:      make([]float64, 0, ARRAY_SIZE),
-		slippageAvg:      0,
-		spreadPct:        make([]float64, 0, ARRAY_SIZE),
-		spreadAvg:        0,
-		spreadRegime:     "low",
-		MarkPrice:        0,
-		Price:            0,
-		bestBid:          0,
-		bestAsk:          0,
-		asksVol:          0,
-		bidsVol:          0,
-		volumePct:        0,
-		vpoc:             0,
-		vpocProfile:      VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
-		volatilityPct:    0,
-		volatilityRegime: "low",
-		latencyBufferPct: 0,
-		tradePerMinute:   0,
-		lastTradePrice:   0,
-		openInterest:     0,
-		fundingRate:      0,
-		m1_SMA:           0,
-		m1_SMASlope:      0,
+		parent:             parent,
+		Pair:               pair,
+		Bars:               make([]exchange.Bar, 0, ARRAY_SIZE),
+		Trades:             make([]exchange.Trade, 0, ARRAY_SIZE),
+		Prices:             make([][2]exchange.Price, 0, ARRAY_SIZE),
+		slippagePct:        make([]float64, 0, ARRAY_SIZE),
+		slippageAvg:        0,
+		spreadPct:          make([]float64, 0, ARRAY_SIZE),
+		spreadAvg:          0,
+		spreadRegime:       "low",
+		MarkPrice:          0,
+		Price:              0,
+		bestBid:            0,
+		bestAsk:            0,
+		asksVol:            0,
+		bidsVol:            0,
+		volumePct:          0,
+		nearVolumeStrength: 0,
+		nearVolumeAvg:      0,
+		vpoc:               0,
+		vpocProfile:        VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
+		volatilityPct:      0,
+		volatilityRegime:   "low",
+		latencyBufferPct:   0,
+		tradePerMinute:     0,
+		lastTradePrice:     0,
+		openInterest:       0,
+		fundingRate:        0,
+		m1_SMA:             0,
+		m1_SMASlope:        0,
 	}
 }
 
@@ -207,6 +214,13 @@ func (strat *Marketmaker) Start(ctx context.Context) {
 	defer mainTicker.Stop()
 	syncTicker := time.NewTicker(5 * time.Minute)
 	defer syncTicker.Stop()
+
+	// pd, err := strat.Exchange.Pair("BTC")
+	// if err != nil {
+	// 	log.Printf("Error getting BTCUSDT pair: %v", err)
+	// }
+	// log.Printf("%s %+v", pd.Base.Name, pd.Base.TickSize)
+	// log.Printf("%s %+v", pd.Quote.Name, pd.Quote.TickSize)
 
 	for {
 		select {

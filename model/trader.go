@@ -155,33 +155,43 @@ func pricePairTime(pricePair [2]exchange.Price) time.Time {
 }
 
 func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
-	asksVol, bidsVol, volumePct, vpoc := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
+	asksVol, bidsVol, volumePct, bidNearNotional, askNearNotional, vpoc := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
 
 	t.Lock()
 	defer t.Unlock()
 
+	strongestNearNotional := math.Max(bidNearNotional, askNearNotional)
+	t.nearVolumeAvg = EMA(strongestNearNotional, t.nearVolumeAvg, EMA_ALPHA_SLOW)
+
 	t.asksVol = asksVol
 	t.bidsVol = bidsVol
 	t.volumePct = volumePct
+	t.nearVolumeStrength = calculateNearVolumeStrength(bidNearNotional, askNearNotional, t.nearVolumeAvg)
 	t.vpoc = vpoc
 }
 
-func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64, float64, float64, float64) {
+func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64, float64, float64, float64, float64, float64) {
 	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, 0, 0
 	}
 
 	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
 	if mid <= 0 {
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, 0, 0
+	}
+
+	tickSize := 0.0
+	if t.parent != nil && t.parent.Exchange != nil {
+		if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
+			tickSize = pair.Base.TickSize
+		}
 	}
 
 	// VPOC Initialization
-	if t.vpocProfile.Buckets == nil && t.parent != nil && t.parent.Exchange != nil {
-		pair, err := t.parent.Exchange.Pair(t.Pair)
-		if err == nil && pair.Base.TickSize > 0 {
+	if t.vpocProfile.Buckets == nil {
+		if tickSize > 0 {
 			t.vpocProfile.Buckets = make(map[int64]float64)
-			t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), pair.Base.TickSize)
+			t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
 			t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
 		}
 	}
@@ -204,8 +214,11 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	}
 
 	maxDistance := mid * ((ORDERBOOK_RANGE_PCT / 2) / 100)
+	bidNearMinPrice := ob.Bids[0].Price * (1 - (ORDERBOOK_NEAR_RANGE_PCT / 100))
+	askNearMaxPrice := ob.Asks[0].Price * (1 + (ORDERBOOK_NEAR_RANGE_PCT / 100))
 	var weightedBidNotional, weightedAskNotional float64
 	var actualBidNotional, actualAskNotional float64
+	var bidNearNotional, askNearNotional float64
 
 	process := func(bookLevels []exchange.Price, isBid bool) {
 		for i := 0; i < levels && i < len(bookLevels); i++ {
@@ -229,12 +242,19 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 
 			// 3. Consistent Notional Imbalance
 			notional := level.Price * level.Size
+			weightedNotional := notional * weight
 			if isBid {
-				weightedBidNotional += notional * weight
+				weightedBidNotional += weightedNotional
 				actualBidNotional += notional
+				if level.Price >= bidNearMinPrice {
+					bidNearNotional += notional
+				}
 			} else {
-				weightedAskNotional += notional * weight
+				weightedAskNotional += weightedNotional
 				actualAskNotional += notional
+				if level.Price <= askNearMaxPrice {
+					askNearNotional += notional
+				}
 			}
 
 			if vpocEnabled {
@@ -254,7 +274,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	}
 
 	if !vpocEnabled {
-		return actualAskNotional, actualBidNotional, imbalance, 0
+		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0
 	}
 
 	// 2. Optimized VPOC Search
@@ -274,11 +294,26 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	}
 
 	if maxAreaVolume <= 0 {
-		return actualAskNotional, actualBidNotional, imbalance, 0
+		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0
 	}
 
 	vpoc := (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
-	return actualAskNotional, actualBidNotional, imbalance, vpoc
+	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, vpoc
+}
+
+func calculateNearVolumeStrength(bidNearNotional, askNearNotional, averageNearNotional float64) float64 {
+	if averageNearNotional <= 0 {
+		return 0
+	}
+	strongest := math.Max(bidNearNotional, askNearNotional)
+	strength := math.Min(strongest/(averageNearNotional*ORDERBOOK_NEAR_STRENGTH_REF), 1) * 100
+	if askNearNotional > bidNearNotional {
+		return -strength
+	}
+	if bidNearNotional > askNearNotional {
+		return strength
+	}
+	return 0
 }
 
 type VPOCProfile struct {
