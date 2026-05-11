@@ -49,6 +49,7 @@ type dashboardTemplateData struct {
 	RefreshMs          int
 	ChartScaleRatio    float64
 	NearRangePct       float64
+	OrderbookRangePct  float64
 }
 
 type DashboardPairData struct {
@@ -294,7 +295,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			opacity: 0.9;
 		}
 		.near-marker-boundary {
-			border-top-style: dashed;
 			opacity: 0.65;
 		}
 		.near-marker-bid {
@@ -340,6 +340,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		const DASHBOARD_REFRESH_MS = {{ .RefreshMs }};
 		const CHART_SCALE_RATIO = {{ .ChartScaleRatio }};
 		const ORDERBOOK_NEAR_RANGE_PCT = {{ .NearRangePct }};
+		const ORDERBOOK_RANGE_PCT = {{ .OrderbookRangePct }};
 		let chartWindowSeconds = DASHBOARD_CHART_WINDOW_SECONDS;
 		let charts = {};
 		let renderedKeys = [];
@@ -395,7 +396,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						borderColor: '#dbdbdb',
 						backgroundColor: 'rgba(219, 219, 219, 0.10)',
 						borderWidth: 1.4,
-						borderDash: [6, 4],
 						pointRadius: 0,
 						pointHoverRadius: 0,
 						tension: 0,
@@ -603,18 +603,19 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 
 		function metricsHtml(row) {
 			const digits = priceDigits(row);
+			const orderbookDigits = Math.max(0, digits - 1);
 			return '<div class="pair-title">' +
 				'<div class="symbol">' + row.symbol + '</div>' +
 			'</div>' +
 			'<div class="metric-grid">' +
 				metric('VPOC', fmtPrice(row.vpoc, digits)) +
-				compactMetric('OB Window', fmtPrice(row.ob_min_price, digits) + ' / ' + fmtPrice(row.ob_max_price, digits)) +
+				compactMetric('Orderbook Range ' + ORDERBOOK_RANGE_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imb', pct(row.volume_pct), cls(row.volume_pct)) +
 				metric('Volume Near', pct(row.near_volume), cls(row.near_volume)) +
 				regimeMetric('Spread Avg', pct(row.spread_avg), row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
-				regimeMetric('Vol 10s', pct(row.volatility_pct), row.volatility_regime) +
+				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
 				metric('m1_SMA', fmtPrice(row.m1_sma, digits)) +
@@ -995,6 +996,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		RefreshMs:          int(DASHBOARD_REFRESH_INTERVAL / time.Millisecond),
 		ChartScaleRatio:    CHART_SCALE_RATIO,
 		NearRangePct:       ORDERBOOK_NEAR_RANGE_PCT,
+		OrderbookRangePct:  ORDERBOOK_RANGE_PCT,
 	}
 	if err := template.Must(template.New("dashboard").Parse(tmpl)).Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
