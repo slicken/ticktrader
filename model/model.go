@@ -17,15 +17,16 @@ const (
 
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
-	EMA_ALPHA              = 0.05 // Smoothing factor for exponential moving average calculations
-	EMA_ALPHA_SLOW         = 0.01 // Slower smoothing factor for baseline/regime calculations
 	LATENCY_MIN_BUFFER_PCT = 0.01 // Minimum pct price buffer to account for latency when placing orders
+	LATENCY_EMA_ALPHA      = 0.05 // EMA alpha for latencyBufferPct (calculateLatencyBufferPct in updatePrices)
 
 	VOLATILITY_WINDOW      = 10 * time.Second // Lookback window for realized volatility calculation
-	VOLATILITY_LOW_PCT     = 0.003            // Threshold for "low" volatility regime, as a pct of price
-	VOLATILITY_HIGH_PCT    = 0.02             // Threshold for "high" volatility regime, as a pct of price
-	VOLATILITY_EXTREME_PCT = 0.05             // Threshold for "extreme" volatility regime, as a pct of price
+	VOLATILITY_EMA_ALPHA   = 0.01             // EMA alpha for volatilityPct (calculateVolatilityPct in updatePrices)
+	VOLATILITY_LOW_PCT     = 0.0005           // Threshold for "low" volatility regime, as a pct of price
+	VOLATILITY_HIGH_PCT    = 0.005            // Threshold for "high" volatility regime, as a pct of price
+	VOLATILITY_EXTREME_PCT = 0.015            // Threshold for "extreme" volatility regime, as a pct of price
 
+	SPREAD_EMA_ALPHA   = 0.004 // EMA alpha for spreadAvg (instant bid-ask spread pct in updatePrices)
 	SPREAD_LOW_PCT     = 0.005 // Threshold for "low" spread regime, as a pct of price
 	SPREAD_HIGH_PCT    = 0.02  // Threshold for "high" spread regime, as a pct of price
 	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
@@ -34,8 +35,9 @@ const (
 	ORDERBOOK_DEPTH_PCT         = 0.5   // Only analyse orders within this percent depth from mid on each side
 	ORDERBOOK_WEIGHT_FACTOR     = 0.0   // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
 	ORDERBOOK_NEAR_DEPTH_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
+	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01  // EMA alpha for nearVolumeAvg baseline (strongest near notional in updateVolumes)
 	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
-	ORDERBOOK_VPOC_DECAY_FACTOR = 0.0   // 0 = Disabled. 1 = 100%
+	ORDERBOOK_VPOC_DECAY_FACTOR = 0.92  // 0 = Disabled. 1 = 100%
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -55,7 +57,6 @@ type trader struct {
 	Prices             [][2]exchange.Price
 	slippagePct        []float64
 	slippageAvg        float64
-	spreadPct          []float64
 	spreadAvg          float64
 	spreadRegime       string
 	MarkPrice          float64
@@ -76,8 +77,10 @@ type trader struct {
 	lastTradePrice     float64
 	openInterest       float64
 	fundingRate        float64
-	m1_SMA             float64
-	m1_SMASlope        float64
+	m1_SMA20           float64
+	m1_SMA20Slope      float64
+	m1_SMA200          float64
+	m1_SMA200Slope     float64
 	sync.RWMutex
 }
 
@@ -179,7 +182,6 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		Prices:             make([][2]exchange.Price, 0, ARRAY_SIZE),
 		slippagePct:        make([]float64, 0, ARRAY_SIZE),
 		slippageAvg:        0,
-		spreadPct:          make([]float64, 0, ARRAY_SIZE),
 		spreadAvg:          0,
 		spreadRegime:       "low",
 		MarkPrice:          0,
@@ -200,8 +202,10 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		lastTradePrice:     0,
 		openInterest:       0,
 		fundingRate:        0,
-		m1_SMA:             0,
-		m1_SMASlope:        0,
+		m1_SMA20:           0,
+		m1_SMA20Slope:      0,
+		m1_SMA200:          0,
+		m1_SMA200Slope:     0,
 	}
 }
 
@@ -384,7 +388,10 @@ func (strat *Marketmaker) getInitialBars(pair string) error {
 		insertWithLimitInPlace(&t.Bars, bar, ARRAY_SIZE)
 	}
 	if sma := calculateSMA(t.Bars, 20); sma > 0 {
-		t.m1_SMA = sma
+		t.m1_SMA20 = sma
+	}
+	if sma := calculateSMA(t.Bars, 200); sma > 0 {
+		t.m1_SMA200 = sma
 	}
 
 	return nil

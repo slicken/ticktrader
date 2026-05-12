@@ -21,20 +21,21 @@ const (
 )
 
 type Dashboard struct {
-	model     *Marketmaker
 	addr      string
 	server    *http.Server
-	historyMu sync.Mutex
+	model     *Marketmaker
 	histories map[string]*dashboardHistory
+	mu        sync.Mutex
 }
 
 type dashboardHistory struct {
 	// PairedQuotes keeps each bid with the ask from the same exchange update.
 	// Merging bids and asks in separate slices breaks index alignment and makes charts look spiky.
-	PairedQuotes [][2]exchange.Price
-	MarkPrices   []exchange.Price
-	M1SMAPrices  []exchange.Price
-	Trades       []dashboardTradePoint
+	PairedQuotes   [][2]exchange.Price
+	MarkPrices     []exchange.Price
+	M1SMA20Prices  []exchange.Price
+	M1SMA200Prices []exchange.Price
+	Trades         []dashboardTradePoint
 }
 
 type DashboardData struct {
@@ -70,12 +71,15 @@ type DashboardPairData struct {
 	TradesPerMinute  int                   `json:"trades_per_minute"`
 	OpenInterest     int64                 `json:"open_interest"`
 	FundingRate      float64               `json:"funding_rate"`
-	M1_SMA           float64               `json:"m1_sma"`
-	M1_SMASlope      float64               `json:"m1_sma_slope"`
+	M1_SMA20         float64               `json:"m1_sma20"`
+	M1_SMA20Slope    float64               `json:"m1_sma20_slope"`
+	M1_SMA200        float64               `json:"m1_sma200"`
+	M1_SMA200Slope   float64               `json:"m1_sma200_slope"`
 	BidPrices        []exchange.Price      `json:"bid_prices"`
 	AskPrices        []exchange.Price      `json:"ask_prices"`
 	MarkPrices       []exchange.Price      `json:"mark_prices"`
-	M1SMAPrices      []exchange.Price      `json:"m1_sma_prices"`
+	M1SMA20Prices    []exchange.Price      `json:"m1_sma20_prices"`
+	M1SMA200Prices   []exchange.Price      `json:"m1_sma200_prices"`
 	OBBidLevels      []exchange.Price      `json:"ob_bid_levels"`
 	OBAskLevels      []exchange.Price      `json:"ob_ask_levels"`
 	OBMinPrice       float64               `json:"ob_min_price"`
@@ -383,10 +387,19 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						pointHoverRadius: 0,
 						tension: 0,
 					}, {
-						label: 'm1_SMA',
+						label: 'm1_SMA20',
 						data: [],
 						borderColor: '#1d4ed8',
 						backgroundColor: 'rgba(29, 78, 216, 0.10)',
+						borderWidth: 1.4,
+						pointRadius: 0,
+						pointHoverRadius: 0,
+						tension: 0,
+					}, {
+						label: 'm1_SMA200',
+						data: [],
+						borderColor: '#f23645',
+						backgroundColor: 'rgba(242, 54, 69, 0.10)',
 						borderWidth: 1.4,
 						pointRadius: 0,
 						pointHoverRadius: 0,
@@ -497,24 +510,26 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			return series.filter(point => new Date(point.Time).getTime() >= cutoffMs);
 		}
 
-		function trimRollingChartWindow(bids, asks, marks, m1smas, trades) {
+		function trimRollingChartWindow(bids, asks, marks, m1sma20s, m1sma200s, trades) {
 			const windowMs = chartWindowSeconds * 1000;
 			const endMs = Math.max(
 				maxTimeMs(bids),
 				maxTimeMs(asks),
 				maxTimeMs(marks),
-				maxTimeMs(m1smas),
+				maxTimeMs(m1sma20s),
+				maxTimeMs(m1sma200s),
 				maxTimeMs(trades),
 			);
 			if (!Number.isFinite(endMs) || endMs <= 0) {
-				return { bids, asks, marks, m1smas, trades };
+				return { bids, asks, marks, m1sma20s, m1sma200s, trades };
 			}
 
 			const cutoffMs = endMs - windowMs;
 			let nextBids = trimPricesByWindow(bids, cutoffMs);
 			let nextAsks = trimPricesByWindow(asks, cutoffMs);
 			const nextMarks = trimPricesByWindow(marks, cutoffMs);
-			const nextM1Smas = trimPricesByWindow(m1smas, cutoffMs);
+			const nextM1Sma20s = trimPricesByWindow(m1sma20s, cutoffMs);
+			const nextM1Sma200s = trimPricesByWindow(m1sma200s, cutoffMs);
 			const nextTrades = trimPricesByWindow(trades, cutoffMs);
 
 			const pairCount = Math.min(nextBids.length, nextAsks.length);
@@ -525,7 +540,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				bids: nextBids,
 				asks: nextAsks,
 				marks: nextMarks,
-				m1smas: nextM1Smas,
+				m1sma20s: nextM1Sma20s,
+				m1sma200s: nextM1Sma200s,
 				trades: nextTrades,
 			};
 		}
@@ -626,8 +642,10 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
-				metric('m1_SMA', fmtPrice(row.m1_sma, digits)) +
-				metric('m1_SMA Slope', pct(row.m1_sma_slope), cls(row.m1_sma_slope)) +
+				metric('m1_SMA20', fmtPrice(row.m1_sma20, digits)) +
+				metric('m1_SMA20 Slope', pct(row.m1_sma20_slope), cls(row.m1_sma20_slope)) +
+				metric('m1_SMA200', fmtPrice(row.m1_sma200, digits)) +
+				metric('m1_SMA200 Slope', pct(row.m1_sma200_slope), cls(row.m1_sma200_slope)) +
 			'</div>';
 		}
 
@@ -675,13 +693,15 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			let bids = (row.bid_prices || []).slice().reverse();
 			let asks = (row.ask_prices || []).slice().reverse();
 			let marks = (row.mark_prices || []).slice().reverse();
-			let m1smas = (row.m1_sma_prices || []).slice().reverse();
+			let m1sma20s = (row.m1_sma20_prices || []).slice().reverse();
+			let m1sma200s = (row.m1_sma200_prices || []).slice().reverse();
 			let trades = (row.trades || []).slice().reverse();
-			const trimmed = trimRollingChartWindow(bids, asks, marks, m1smas, trades);
+			const trimmed = trimRollingChartWindow(bids, asks, marks, m1sma20s, m1sma200s, trades);
 			bids = trimmed.bids;
 			asks = trimmed.asks;
 			marks = trimmed.marks;
-			m1smas = trimmed.m1smas;
+			m1sma20s = trimmed.m1sma20s;
+			m1sma200s = trimmed.m1sma200s;
 			trades = trimmed.trades;
 			if (points) points.textContent = bids.length + ' points / ' + chartWindowLabel();
 
@@ -695,20 +715,22 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[1].label = 'ask';
 			chart.data.datasets[2].data = alignSeriesToPrices(bids, marks);
 			chart.data.datasets[2].label = 'mark';
-			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1smas);
-			chart.data.datasets[3].label = 'm1_SMA';
-			chart.data.datasets[4].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
-			chart.data.datasets[4].label = 'VPOC';
+			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1sma20s);
+			chart.data.datasets[3].label = 'm1_SMA20';
+			chart.data.datasets[4].data = alignSeriesToPrices(bids, m1sma200s);
+			chart.data.datasets[4].label = 'm1_SMA200';
+			chart.data.datasets[5].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
+			chart.data.datasets[5].label = 'VPOC';
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
-			chart.data.datasets[5].data = tradeAlign.prices;
-			chart.data.datasets[5].tradeSizes = tradeAlign.sizes;
-			chart.data.datasets[5].tradeStarts = tradeAlign.starts;
-			chart.data.datasets[5].tradeEnds = tradeAlign.ends;
-			chart.data.datasets[5].tradeSides = tradeAlign.sides;
+			chart.data.datasets[6].data = tradeAlign.prices;
+			chart.data.datasets[6].tradeSizes = tradeAlign.sizes;
+			chart.data.datasets[6].tradeStarts = tradeAlign.starts;
+			chart.data.datasets[6].tradeEnds = tradeAlign.ends;
+			chart.data.datasets[6].tradeSides = tradeAlign.sides;
 			const tradeRadii = radiiFromTradeSizes(tradeAlign.prices, tradeAlign.sizes);
-			chart.data.datasets[5].pointRadius = tradeRadii;
-			chart.data.datasets[5].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
-			chart.data.datasets[5].label = 'trades';
+			chart.data.datasets[6].pointRadius = tradeRadii;
+			chart.data.datasets[6].pointHoverRadius = tradeRadii.map(r => (r > 0 ? r + 2.5 : 0));
+			chart.data.datasets[6].label = 'trades';
 			setPriceScale(chart, bids, asks, marks, tradeAlign.prices, row.ob_bid_levels || [], row.ob_ask_levels || []);
 			chart.update('none');
 			renderOrderbookDepth(i, chart, row.ob_bid_levels || [], row.ob_ask_levels || []);
@@ -1082,12 +1104,15 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			TradesPerMinute:  t.tradePerMinute,
 			OpenInterest:     int64(t.openInterest),
 			FundingRate:      t.fundingRate,
-			M1_SMA:           t.m1_SMA,
-			M1_SMASlope:      t.m1_SMASlope,
+			M1_SMA20:         t.m1_SMA20,
+			M1_SMA20Slope:    t.m1_SMA20Slope,
+			M1_SMA200:        t.m1_SMA200,
+			M1_SMA200Slope:   t.m1_SMA200Slope,
 			BidPrices:        bidPrices,
 			AskPrices:        askPrices,
 			MarkPrices:       dashboardPricePoint(t.MarkPrice, sampleTime),
-			M1SMAPrices:      dashboardPricePoint(t.m1_SMA, sampleTime),
+			M1SMA20Prices:    dashboardPricePoint(t.m1_SMA20, sampleTime),
+			M1SMA200Prices:   dashboardPricePoint(t.m1_SMA200, sampleTime),
 			OBBidLevels:      obBids,
 			OBAskLevels:      obAsks,
 			OBMinPrice:       obMinPrice,
@@ -1116,8 +1141,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 }
 
 func (d *Dashboard) applyHistory(key string, row *DashboardPairData) {
-	d.historyMu.Lock()
-	defer d.historyMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	history := d.histories[key]
 	if history == nil {
@@ -1132,14 +1157,16 @@ func (d *Dashboard) applyHistory(key string, row *DashboardPairData) {
 		cutoff,
 	)
 	history.MarkPrices = trimDashboardPrices(mergeLatestPrices(history.MarkPrices, row.MarkPrices), cutoff)
-	history.M1SMAPrices = trimDashboardPrices(mergeLatestPrices(history.M1SMAPrices, row.M1SMAPrices), cutoff)
+	history.M1SMA20Prices = trimDashboardPrices(mergeLatestPrices(history.M1SMA20Prices, row.M1SMA20Prices), cutoff)
+	history.M1SMA200Prices = trimDashboardPrices(mergeLatestPrices(history.M1SMA200Prices, row.M1SMA200Prices), cutoff)
 	history.Trades = trimDashboardTrades(mergeLatestTrades(history.Trades, row.Trades), cutoff)
 
 	bids, asks := splitBidAskPricePairs(history.PairedQuotes)
 	row.BidPrices = copyLatestPrices(bids)
 	row.AskPrices = copyLatestPrices(asks)
 	row.MarkPrices = copyLatestPrices(history.MarkPrices)
-	row.M1SMAPrices = copyLatestPrices(history.M1SMAPrices)
+	row.M1SMA20Prices = copyLatestPrices(history.M1SMA20Prices)
+	row.M1SMA200Prices = copyLatestPrices(history.M1SMA200Prices)
 	row.Trades = copyLatestTrades(history.Trades)
 }
 

@@ -42,27 +42,11 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	mid := (bid + ask) / 2
 	spreadPct := ((ask - bid) / mid) * 100
 	insertWithLimitInPlace(&t.Prices, [2]exchange.Price{bidPrice, askPrice}, ARRAY_SIZE)
-	insertWithLimitInPlace(&t.spreadPct, spreadPct, ARRAY_SIZE)
-	t.volatilityPct = EMA(calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW), t.volatilityPct, EMA_ALPHA)
+	t.volatilityPct = EMA(calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW), t.volatilityPct, VOLATILITY_EMA_ALPHA)
 	t.volatilityRegime = volatilityRegime(t.volatilityPct)
-	t.latencyBufferPct = EMA(calculateLatencyBufferPct(t.parent.Exchange.GetLatency(), spreadPct), t.latencyBufferPct, EMA_ALPHA)
-	t.updateSpreadAvg()
+	t.latencyBufferPct = EMA(calculateLatencyBufferPct(t.parent.Exchange.GetLatency(), spreadPct), t.latencyBufferPct, LATENCY_EMA_ALPHA)
+	t.spreadAvg = EMA(spreadPct, t.spreadAvg, SPREAD_EMA_ALPHA)
 	t.spreadRegime = spreadRegime(t.spreadAvg)
-}
-
-// updateSpreadAvg recalculates the rolling average bid/ask spread.
-// The caller must hold t.Lock.
-func (t *trader) updateSpreadAvg() {
-	if len(t.spreadPct) == 0 {
-		t.spreadAvg = 0
-		return
-	}
-
-	var sum float64
-	for _, spread := range t.spreadPct {
-		sum += spread
-	}
-	t.spreadAvg = sum / float64(len(t.spreadPct))
 }
 
 func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
@@ -72,12 +56,11 @@ func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
 	return math.Max(fixedBuffer+adaptiveBuffer, LATENCY_MIN_BUFFER_PCT)
 }
 
-// calculateVolatilityPct returns realized mid-price volatility over a time
-// window as a percent. The newest price pair is expected at index 0.
 func calculateVolatilityPct(prices [][2]exchange.Price, window time.Duration) float64 {
-	if window <= 0 || len(prices) < 2 {
+	if len(prices) < 2 || window <= 0 {
 		return 0
 	}
+
 	latestTime := pricePairTime(prices[0])
 	if latestTime.IsZero() {
 		return 0
@@ -85,30 +68,23 @@ func calculateVolatilityPct(prices [][2]exchange.Price, window time.Duration) fl
 	cutoff := latestTime.Add(-window)
 
 	var sumSq float64
-	var count int
+	// We loop back from the newest price (index 0) to the cutoff
 	for i := 1; i < len(prices); i++ {
-		newerTime := pricePairTime(prices[i-1])
-		if newerTime.IsZero() {
-			continue
-		}
-		if newerTime.Before(cutoff) {
+		if pricePairTime(prices[i-1]).Before(cutoff) {
 			break
 		}
 
 		newerMid := midPrice(prices[i-1])
 		olderMid := midPrice(prices[i])
-		if newerMid <= 0 || olderMid <= 0 {
-			continue
+
+		if newerMid > 0 && olderMid > 0 {
+			// Log returns capture the "energy" of each zig and zag
+			logReturn := math.Log(newerMid / olderMid)
+			sumSq += logReturn * logReturn
 		}
-
-		logReturn := math.Log(newerMid / olderMid)
-		sumSq += logReturn * logReturn
-		count++
 	}
 
-	if count == 0 {
-		return 0
-	}
+	// math.Sqrt(sumSq) aggregates the "energy" of all moves in the window.
 	return math.Sqrt(sumSq) * 100
 }
 
@@ -161,7 +137,7 @@ func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
 	defer t.Unlock()
 
 	strongestNearNotional := math.Max(bidNearNotional, askNearNotional)
-	t.nearVolumeAvg = EMA(strongestNearNotional, t.nearVolumeAvg, EMA_ALPHA_SLOW)
+	t.nearVolumeAvg = EMA(strongestNearNotional, t.nearVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
 
 	t.asksVol = asksVol
 	t.bidsVol = bidsVol
@@ -488,13 +464,20 @@ func (t *trader) updateBar(bar *exchange.Bar) {
 	t.Lock()
 	defer t.Unlock()
 
-	previousSMA := t.m1_SMA
+	previousSMA20 := t.m1_SMA20
+	previousSMA200 := t.m1_SMA200
 	t.updateBars(*bar)
 
 	if sma := calculateSMA(t.Bars, 20); sma > 0 {
-		t.m1_SMA = sma
-		if previousSMA > 0 {
-			t.m1_SMASlope = ((sma - previousSMA) / previousSMA) * 100
+		t.m1_SMA20 = sma
+		if previousSMA20 > 0 {
+			t.m1_SMA20Slope = ((sma - previousSMA20) / previousSMA20) * 100
+		}
+	}
+	if sma := calculateSMA(t.Bars, 200); sma > 0 {
+		t.m1_SMA200 = sma
+		if previousSMA200 > 0 {
+			t.m1_SMA200Slope = ((sma - previousSMA200) / previousSMA200) * 100
 		}
 	}
 }

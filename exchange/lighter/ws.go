@@ -9,9 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"trader-mux/exchange"
+
 	lighterapi "github.com/defi-maker/golighter/client"
 	"github.com/gorilla/websocket"
-	"trader-mux/exchange"
 )
 
 func (e *Lighter) subscribeOrderbookRaw(ctx context.Context, market marketInfo) (func() error, error) {
@@ -39,40 +40,130 @@ func (e *Lighter) subscribeMarketStatsRaw(ctx context.Context, market marketInfo
 }
 
 func (e *Lighter) subscribeRaw(ctx context.Context, channel string, handle func([]byte) error) (func() error, error) {
-	conn, _, err := websocket.DefaultDialer.Dial(e.wsURL, http.Header{})
-	if err != nil {
-		return nil, err
-	}
+	runCtx, runCancel := context.WithCancel(ctx)
 
-	var writeMu sync.Mutex
-	writeJSON := func(value any) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return conn.WriteJSON(value)
-	}
+	var connMu sync.Mutex
+	var currentConn *websocket.Conn
 
-	if err := writeJSON(map[string]string{
-		"type":    "subscribe",
-		"channel": channel,
-	}); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if e.Exchange.Debug {
-		log.Printf("[Lighter] websocket subscribed %s", channel)
-	}
+	go func() {
+		const minBackoff = time.Second
+		const maxBackoff = 30 * time.Second
+		backoff := minBackoff
 
-	subCtx, cancel := context.WithCancel(ctx)
-	go e.readRaw(subCtx, conn, channel, writeJSON, handle)
+		for {
+			if runCtx.Err() != nil {
+				return
+			}
+
+			conn, _, err := websocket.DefaultDialer.Dial(e.wsURL, http.Header{})
+			if err != nil {
+				if runCtx.Err() == nil {
+					log.Printf("[Lighter] websocket %s dial error: %v", channel, err)
+				}
+				if !sleepCtx(runCtx, backoff) {
+					return
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+
+			if runCtx.Err() != nil {
+				_ = conn.Close()
+				return
+			}
+
+			var writeMu sync.Mutex
+			writeJSON := func(value any) error {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				return conn.WriteJSON(value)
+			}
+
+			if err := writeJSON(map[string]string{
+				"type":    "subscribe",
+				"channel": channel,
+			}); err != nil {
+				if runCtx.Err() == nil {
+					log.Printf("[Lighter] websocket %s subscribe send failed: %v", channel, err)
+				}
+				_ = conn.Close()
+				if !sleepCtx(runCtx, backoff) {
+					return
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			if e.Exchange.Debug {
+				log.Printf("[Lighter] websocket subscribed %s", channel)
+			}
+
+			connMu.Lock()
+			currentConn = conn
+			connMu.Unlock()
+			backoff = minBackoff
+
+			connCtx, connCancel := context.WithCancel(runCtx)
+			done := make(chan struct{})
+			go func(c *websocket.Conn) {
+				defer close(done)
+				e.readRaw(connCtx, c, channel, writeJSON, handle)
+			}(conn)
+
+			<-done
+			connCancel()
+
+			connMu.Lock()
+			currentConn = nil
+			connMu.Unlock()
+
+			if runCtx.Err() != nil {
+				return
+			}
+			log.Printf("[Lighter] websocket %s disconnected, reconnecting...", channel)
+			if !sleepCtx(runCtx, backoff) {
+				return
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+		}
+	}()
 
 	return func() error {
-		cancel()
-		_ = writeJSON(map[string]string{
-			"type":    "unsubscribe",
-			"channel": channel,
-		})
-		return conn.Close()
+		runCancel()
+		connMu.Lock()
+		c := currentConn
+		currentConn = nil
+		connMu.Unlock()
+		if c != nil {
+			_ = c.Close()
+		}
+		return nil
 	}, nil
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func (e *Lighter) readRaw(ctx context.Context, conn *websocket.Conn, channel string, writeJSON func(any) error, handle func([]byte) error) {
