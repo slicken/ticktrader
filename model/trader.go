@@ -187,35 +187,36 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 		}
 	}
 
-	// VPOC Initialization
-	if t.vpocProfile.Buckets == nil {
-		if tickSize > 0 {
-			t.vpocProfile.Buckets = make(map[int64]float64)
-			t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
-			t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
-		}
+	// VPOC buckets group nearby price levels. A positive decay factor keeps a
+	// decayed profile; zero or lower uses only the current orderbook snapshot.
+	if t.vpocProfile.BucketSize <= 0 && tickSize > 0 {
+		t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
 	}
+	t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
 
-	vpocEnabled := t.vpocProfile.BucketSize > 0 && t.vpocProfile.Buckets != nil
-
-	// 1. Guarded VPOC Math
+	vpocEnabled := t.vpocProfile.BucketSize > 0
+	var vpocBuckets map[int64]float64
+	vpocBucketPrice := make(map[int64]exchange.Price)
 	if vpocEnabled {
-		currentMidIdx := int64(math.Floor(mid / t.vpocProfile.BucketSize))
-		for idx, volume := range t.vpocProfile.Buckets {
-			decay := t.vpocProfile.DecayFactor
-			if idx == currentMidIdx {
-				decay = math.Min(1.0, decay*1.05)
+		if t.vpocProfile.DecayFactor > 0 {
+			if t.vpocProfile.Buckets == nil {
+				t.vpocProfile.Buckets = make(map[int64]float64)
 			}
-			t.vpocProfile.Buckets[idx] = volume * decay
-			if t.vpocProfile.Buckets[idx] <= 1e-8 {
-				delete(t.vpocProfile.Buckets, idx)
+			for idx, volume := range t.vpocProfile.Buckets {
+				t.vpocProfile.Buckets[idx] = volume * t.vpocProfile.DecayFactor
+				if t.vpocProfile.Buckets[idx] <= 1e-8 {
+					delete(t.vpocProfile.Buckets, idx)
+				}
 			}
+			vpocBuckets = t.vpocProfile.Buckets
+		} else {
+			vpocBuckets = make(map[int64]float64)
 		}
 	}
 
-	maxDistance := mid * ((ORDERBOOK_RANGE_PCT / 2) / 100)
-	bidNearMinPrice := ob.Bids[0].Price * (1 - (ORDERBOOK_NEAR_RANGE_PCT / 100))
-	askNearMaxPrice := ob.Asks[0].Price * (1 + (ORDERBOOK_NEAR_RANGE_PCT / 100))
+	maxDistance := mid * (ORDERBOOK_DEPTH_PCT / 100)
+	bidNearMinPrice := ob.Bids[0].Price * (1 - (ORDERBOOK_NEAR_DEPTH_PCT / 100))
+	askNearMaxPrice := ob.Asks[0].Price * (1 + (ORDERBOOK_NEAR_DEPTH_PCT / 100))
 	var weightedBidNotional, weightedAskNotional float64
 	var actualBidNotional, actualAskNotional float64
 	var bidNearNotional, askNearNotional float64
@@ -259,7 +260,10 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 
 			if vpocEnabled {
 				idx := int64(math.Floor(level.Price / t.vpocProfile.BucketSize))
-				t.vpocProfile.Buckets[idx] += notional
+				vpocBuckets[idx] += notional
+				if levelNotional, exists := vpocBucketPrice[idx]; !exists || notional > levelNotional.Size {
+					vpocBucketPrice[idx] = exchange.Price{Price: level.Price, Size: notional}
+				}
 			}
 		}
 	}
@@ -277,27 +281,27 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0
 	}
 
-	// 2. Optimized VPOC Search
+	// VPOC is the highest-volume price level inside the single highest-volume bucket.
 	var bestIdx int64
-	var maxAreaVolume float64
-	for idx, volume := range t.vpocProfile.Buckets {
-		// Ignore empty buffer buckets or heavily decayed noise
+	var maxBucketVolume float64
+	for idx, volume := range vpocBuckets {
 		if volume <= 1e-6 {
 			continue
 		}
-
-		areaVolume := volume + t.vpocProfile.Buckets[idx+1] + t.vpocProfile.Buckets[idx-1]
-		if areaVolume > maxAreaVolume {
-			maxAreaVolume = areaVolume
+		if volume > maxBucketVolume {
+			maxBucketVolume = volume
 			bestIdx = idx
 		}
 	}
 
-	if maxAreaVolume <= 0 {
+	if maxBucketVolume <= 0 {
 		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0
 	}
 
-	vpoc := (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
+	vpoc := vpocBucketPrice[bestIdx].Price
+	if vpoc <= 0 {
+		vpoc = (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
+	}
 	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, vpoc
 }
 

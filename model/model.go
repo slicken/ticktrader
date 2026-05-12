@@ -31,11 +31,11 @@ const (
 	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
 
 	ORDERBOOK_LEVEL             = 200   // How many orderbook levels to pull/analyze when reading book data
-	ORDERBOOK_RANGE_PCT         = 0.5   // Only analyse orders within this/2 percent range from mid
-	ORDERBOOK_WEIGHT_FACTOR     = 8.0   // 0 = Disabled. With ORDERBOOK_RANGE_PCT=0.5, edge liquidity is weighted near 70%.
-	ORDERBOOK_NEAR_RANGE_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
+	ORDERBOOK_DEPTH_PCT         = 0.5   // Only analyse orders within this percent depth from mid on each side
+	ORDERBOOK_WEIGHT_FACTOR     = 0.0   // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
+	ORDERBOOK_NEAR_DEPTH_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
 	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
-	ORDERBOOK_VPOC_DECAY_FACTOR = 0.9   // Standard decay multiplier
+	ORDERBOOK_VPOC_DECAY_FACTOR = 0.0   // 0 = Disabled. 1 = 100%
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config

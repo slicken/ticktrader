@@ -48,8 +48,8 @@ type dashboardTemplateData struct {
 	ChartWindowSeconds int
 	RefreshMs          int
 	ChartScaleRatio    float64
-	NearRangePct       float64
-	OrderbookRangePct  float64
+	NearDepthPct       float64
+	OrderbookDepthPct  float64
 }
 
 type DashboardPairData struct {
@@ -59,6 +59,7 @@ type DashboardPairData struct {
 	MarkPrice        float64               `json:"mark_price"`
 	MidPrice         float64               `json:"mid_price"`
 	SpreadAvg        float64               `json:"spread_avg"`
+	Spread           float64               `json:"spread"`
 	SpreadRegime     string                `json:"spread_regime"`
 	SlippageAvg      float64               `json:"slippage_avg"`
 	VPOC             float64               `json:"vpoc"`
@@ -339,8 +340,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		const DASHBOARD_CHART_WINDOW_SECONDS = {{ .ChartWindowSeconds }};
 		const DASHBOARD_REFRESH_MS = {{ .RefreshMs }};
 		const CHART_SCALE_RATIO = {{ .ChartScaleRatio }};
-		const ORDERBOOK_NEAR_RANGE_PCT = {{ .NearRangePct }};
-		const ORDERBOOK_RANGE_PCT = {{ .OrderbookRangePct }};
+		const ORDERBOOK_NEAR_DEPTH_PCT = {{ .NearDepthPct }};
+		const ORDERBOOK_DEPTH_PCT = {{ .OrderbookDepthPct }};
 		let chartWindowSeconds = DASHBOARD_CHART_WINDOW_SECONDS;
 		let charts = {};
 		let renderedKeys = [];
@@ -588,6 +589,13 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
+		function regimeCompactMetric(label, value, regime) {
+			return '<div class="metric">' +
+				'<div class="metric-label metric-label-row"><span>' + label + '</span>' + regimeLegendHtml() + '</div>' +
+				'<div class="metric-value compact ' + regimeClass(regime) + '">' + value + '</div>' +
+			'</div>';
+		}
+
 		function regimeClass(regime) {
 			return 'regime-' + (regime || 'low');
 		}
@@ -608,12 +616,12 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				'<div class="symbol">' + row.symbol + '</div>' +
 			'</div>' +
 			'<div class="metric-grid">' +
-				compactMetric('OB Range ' + ORDERBOOK_RANGE_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
+				compactMetric('OB Depth ' + ORDERBOOK_DEPTH_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
 				metric('OB VPOC', fmtPrice(row.vpoc, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imbalance', pct(row.volume_pct), cls(row.volume_pct)) +
 				metric('Volume Near', pct(row.near_volume), cls(row.near_volume)) +
-				regimeMetric('Spread Avg', pct(row.spread_avg), row.spread_regime) +
+				regimeCompactMetric('Spread Avg', pct(row.spread_avg) + ' (' + pct(row.spread) + ')', row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), cls(row.slippage_avg)) +
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
@@ -838,7 +846,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		function drawNearVolumeMarkers(overlay, yScale, chartArea, bidLevels, askLevels) {
 			const bestBid = bidLevels?.[0]?.Price || 0;
 			const bestAsk = askLevels?.[0]?.Price || 0;
-			const depthRatio = ORDERBOOK_NEAR_RANGE_PCT / 100;
+			const depthRatio = ORDERBOOK_NEAR_DEPTH_PCT / 100;
 			if (!(bestBid > 0) || !(bestAsk > 0) || !(depthRatio > 0)) {
 				return;
 			}
@@ -995,8 +1003,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		ChartWindowSeconds: int(DASHBOARD_CHART_WINDOW / time.Second),
 		RefreshMs:          int(DASHBOARD_REFRESH_INTERVAL / time.Millisecond),
 		ChartScaleRatio:    CHART_SCALE_RATIO,
-		NearRangePct:       ORDERBOOK_NEAR_RANGE_PCT,
-		OrderbookRangePct:  ORDERBOOK_RANGE_PCT,
+		NearDepthPct:       ORDERBOOK_NEAR_DEPTH_PCT,
+		OrderbookDepthPct:  ORDERBOOK_DEPTH_PCT,
 	}
 	if err := template.Must(template.New("dashboard").Parse(tmpl)).Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1048,8 +1056,10 @@ func (d *Dashboard) getDashboardData() DashboardData {
 
 		t.RLock()
 		midPrice := t.Price
+		spread := 0.0
 		if t.bestBid > 0 && t.bestAsk > 0 {
 			midPrice = (t.bestBid + t.bestAsk) / 2
+			spread = ((t.bestAsk - t.bestBid) / midPrice) * 100
 		}
 		prices := copyLatestPricePairs(t.Prices)
 		bidPrices, askPrices := splitBidAskPricePairs(prices)
@@ -1061,6 +1071,7 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			MarkPrice:        t.MarkPrice,
 			MidPrice:         midPrice,
 			SpreadAvg:        t.spreadAvg,
+			Spread:           spread,
 			SpreadRegime:     t.spreadRegime,
 			SlippageAvg:      t.slippageAvg,
 			VPOC:             t.vpoc,
@@ -1145,7 +1156,7 @@ func dashboardOrderbookLevels(exch exchange.I, pair string, levels int) ([]excha
 	if mid <= 0 {
 		return nil, nil
 	}
-	maxDistance := mid * ((ORDERBOOK_RANGE_PCT / 2) / 100)
+	maxDistance := mid * (ORDERBOOK_DEPTH_PCT / 100)
 
 	bids := make([]exchange.Price, 0, levels)
 	for i := 0; i < levels && i < len(ob.Bids); i++ {
