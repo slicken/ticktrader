@@ -387,7 +387,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						pointHoverRadius: 0,
 						tension: 0,
 					}, {
-						label: 'm1_SMA20',
+						label: 'SMA20',
 						data: [],
 						borderColor: '#1d4ed8',
 						backgroundColor: 'rgba(29, 78, 216, 0.10)',
@@ -396,7 +396,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						pointHoverRadius: 0,
 						tension: 0,
 					}, {
-						label: 'm1_SMA200',
+						label: 'SMA200',
 						data: [],
 						borderColor: '#f23645',
 						backgroundColor: 'rgba(242, 54, 69, 0.10)',
@@ -642,10 +642,10 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
-				metric('m1_SMA20', fmtPrice(row.m1_sma20, digits)) +
-				metric('m1_SMA20 Slope', pct(row.m1_sma20_slope), cls(row.m1_sma20_slope)) +
-				metric('m1_SMA200', fmtPrice(row.m1_sma200, digits)) +
-				metric('m1_SMA200 Slope', pct(row.m1_sma200_slope), cls(row.m1_sma200_slope)) +
+				metric('SMA20', fmtPrice(row.m1_sma20, digits)) +
+				metric('SMA20 Slope', pct(row.m1_sma20_slope), cls(row.m1_sma20_slope)) +
+				metric('SMA200', fmtPrice(row.m1_sma200, digits)) +
+				metric('SMA200 Slope', pct(row.m1_sma200_slope), cls(row.m1_sma200_slope)) +
 			'</div>';
 		}
 
@@ -716,9 +716,9 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[2].data = alignSeriesToPrices(bids, marks);
 			chart.data.datasets[2].label = 'mark';
 			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1sma20s);
-			chart.data.datasets[3].label = 'm1_SMA20';
+			chart.data.datasets[3].label = 'SMA20';
 			chart.data.datasets[4].data = alignSeriesToPrices(bids, m1sma200s);
-			chart.data.datasets[4].label = 'm1_SMA200';
+			chart.data.datasets[4].label = 'SMA200';
 			chart.data.datasets[5].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
 			chart.data.datasets[5].label = 'VPOC';
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
