@@ -43,10 +43,8 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	spreadPct := ((ask - bid) / mid) * 100
 	insertWithLimitInPlace(&t.Prices, [2]exchange.Price{bidPrice, askPrice}, ARRAY_SIZE)
 	t.volatilityPct = EMA(calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW), t.volatilityPct, VOLATILITY_EMA_ALPHA)
-	t.volatilityRegime = volatilityRegime(t.volatilityPct)
 	t.latencyBufferPct = EMA(calculateLatencyBufferPct(t.parent.Exchange.GetLatency(), spreadPct), t.latencyBufferPct, LATENCY_EMA_ALPHA)
 	t.spreadAvg = EMA(spreadPct, t.spreadAvg, SPREAD_EMA_ALPHA)
-	t.spreadRegime = spreadRegime(t.spreadAvg)
 }
 
 func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
@@ -108,6 +106,19 @@ func spreadRegime(spreadPct float64) string {
 	case spreadPct >= SPREAD_HIGH_PCT:
 		return "high"
 	case spreadPct >= SPREAD_LOW_PCT:
+		return "normal"
+	default:
+		return "low"
+	}
+}
+
+func nearVolumeRegime(strength float64) string {
+	switch {
+	case strength >= ORDERBOOK_NEAR_EXTREME_PCT:
+		return "extreme"
+	case strength >= ORDERBOOK_NEAR_HIGH_PCT:
+		return "high"
+	case strength >= ORDERBOOK_NEAR_NORMAL_PCT:
 		return "normal"
 	default:
 		return "low"
@@ -428,7 +439,8 @@ func (t *trader) calculateSlippage(trade *exchange.Trade) {
 	t.updateSlippageAvg()
 }
 
-// updateSlippageAvg recalculates weighted rolling average slippage magnitude (% from book touch to fills).
+// updateSlippageAvg sets slippageAvg from slippagePct: arithmetic mean when SLIPPAGE_WEIGHT_FACTOR
+// is 0 or >= 1; otherwise geometric weights with that factor (see model.SLIPPAGE_WEIGHT_FACTOR).
 // The caller must hold t.Lock.
 func (t *trader) updateSlippageAvg() {
 	n := len(t.slippagePct)
@@ -440,10 +452,20 @@ func (t *trader) updateSlippageAvg() {
 		n = ARRAY_SIZE
 	}
 
+	f := SLIPPAGE_WEIGHT_FACTOR
+	if f <= 0 || f >= 1 {
+		var sum float64
+		for i := 0; i < n; i++ {
+			sum += t.slippagePct[i]
+		}
+		t.slippageAvg = sum / float64(n)
+		return
+	}
+
 	var weightedSum float64
 	var totalWeight float64
 	for i := 0; i < n; i++ {
-		weight := math.Pow(0.9, float64(n-i-1))
+		weight := math.Pow(f, float64(n-i-1))
 		weightedSum += t.slippagePct[i] * weight
 		totalWeight += weight
 	}

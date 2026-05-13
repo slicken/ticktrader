@@ -54,40 +54,42 @@ type dashboardTemplateData struct {
 }
 
 type DashboardPairData struct {
-	Exchange          string                `json:"exchange"`
-	Symbol            string                `json:"symbol"`
-	PriceDecimals     int                   `json:"price_decimals"`
-	MarkPrice         float64               `json:"mark_price"`
-	MidPrice          float64               `json:"mid_price"`
-	SpreadAvg         float64               `json:"spread_avg"`
-	Spread            float64               `json:"spread"`
-	SpreadRegime      string                `json:"spread_regime"`
-	SlippageAvg       float64               `json:"slippage_avg"`
-	VPOC              float64               `json:"vpoc"`
-	VolumePct         float64               `json:"volume_pct"`
-	NearBidsVolumeStr float64               `json:"near_bids_volume_str"`
-	NearBidsVolumeAvg float64               `json:"near_bids_volume_avg"`
-	NearAsksVolumeStr float64               `json:"near_asks_volume_str"`
-	NearAsksVolumeAvg float64               `json:"near_asks_volume_avg"`
-	VolatilityPct     float64               `json:"volatility_pct"`
-	VolatilityRegime  string                `json:"volatility_regime"`
-	TradesPerMinute   int                   `json:"trades_per_minute"`
-	OpenInterest      int64                 `json:"open_interest"`
-	FundingRate       float64               `json:"funding_rate"`
-	M1_SMA20          float64               `json:"m1_sma20"`
-	M1_SMA20Slope     float64               `json:"m1_sma20_slope"`
-	M1_SMA200         float64               `json:"m1_sma200"`
-	M1_SMA200Slope    float64               `json:"m1_sma200_slope"`
-	BidPrices         []exchange.Price      `json:"bid_prices"`
-	AskPrices         []exchange.Price      `json:"ask_prices"`
-	MarkPrices        []exchange.Price      `json:"mark_prices"`
-	M1SMA20Prices     []exchange.Price      `json:"m1_sma20_prices"`
-	M1SMA200Prices    []exchange.Price      `json:"m1_sma200_prices"`
-	OBBidLevels       []exchange.Price      `json:"ob_bid_levels"`
-	OBAskLevels       []exchange.Price      `json:"ob_ask_levels"`
-	OBMinPrice        float64               `json:"ob_min_price"`
-	OBMaxPrice        float64               `json:"ob_max_price"`
-	Trades            []dashboardTradePoint `json:"trades"`
+	Exchange             string                `json:"exchange"`
+	Symbol               string                `json:"symbol"`
+	PriceDecimals        int                   `json:"price_decimals"`
+	MarkPrice            float64               `json:"mark_price"`
+	MidPrice             float64               `json:"mid_price"`
+	SpreadAvg            float64               `json:"spread_avg"`
+	Spread               float64               `json:"spread"`
+	SpreadRegime         string                `json:"spread_regime"`
+	SlippageAvg          float64               `json:"slippage_avg"`
+	VPOC                 float64               `json:"vpoc"`
+	VolumePct            float64               `json:"volume_pct"`
+	NearBidsVolumeStr    float64               `json:"near_bids_volume_str"`
+	NearBidsVolumeAvg    float64               `json:"near_bids_volume_avg"`
+	NearBidsVolumeRegime string                `json:"near_bids_volume_regime"`
+	NearAsksVolumeStr    float64               `json:"near_asks_volume_str"`
+	NearAsksVolumeAvg    float64               `json:"near_asks_volume_avg"`
+	NearAsksVolumeRegime string                `json:"near_asks_volume_regime"`
+	VolatilityPct        float64               `json:"volatility_pct"`
+	VolatilityRegime     string                `json:"volatility_regime"`
+	TradesPerMinute      int                   `json:"trades_per_minute"`
+	OpenInterest         int64                 `json:"open_interest"`
+	FundingRate          float64               `json:"funding_rate"`
+	M1_SMA20             float64               `json:"m1_sma20"`
+	M1_SMA20Slope        float64               `json:"m1_sma20_slope"`
+	M1_SMA200            float64               `json:"m1_sma200"`
+	M1_SMA200Slope       float64               `json:"m1_sma200_slope"`
+	BidPrices            []exchange.Price      `json:"bid_prices"`
+	AskPrices            []exchange.Price      `json:"ask_prices"`
+	MarkPrices           []exchange.Price      `json:"mark_prices"`
+	M1SMA20Prices        []exchange.Price      `json:"m1_sma20_prices"`
+	M1SMA200Prices       []exchange.Price      `json:"m1_sma200_prices"`
+	OBBidLevels          []exchange.Price      `json:"ob_bid_levels"`
+	OBAskLevels          []exchange.Price      `json:"ob_ask_levels"`
+	OBMinPrice           float64               `json:"ob_min_price"`
+	OBMaxPrice           float64               `json:"ob_max_price"`
+	Trades               []dashboardTradePoint `json:"trades"`
 }
 
 type dashboardTradePoint struct {
@@ -624,11 +626,11 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</span>';
 		}
 
-		function nearVolumeBox(label, strVal, avgVal, strClass) {
+		function nearVolumeBox(label, strVal, avgVal, regime) {
 			return '<div class="metric">' +
-				'<div class="metric-label">' + label + '</div>' +
-				'<div class="metric-value ' + strClass + '">' + pct(strVal) + '</div>' +
-				'<div class="metric-value compact neutral near-volume-avg-line">avg ' + fmt(avgVal, 2) + '</div>' +
+				'<div class="metric-label metric-label-row"><span>' + label + '</span>' + regimeLegendHtml() + '</div>' +
+				'<div class="metric-value ' + regimeClass(regime) + '">' + pct(strVal) + '</div>' +
+				'<div class="metric-value compact ' + regimeClass(regime) + ' near-volume-avg-line">avg ' + fmt(avgVal, 2) + '</div>' +
 			'</div>';
 		}
 
@@ -659,8 +661,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				metric('OB VPOC', fmtPrice(row.vpoc, digits)) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imbalance', pct(row.volume_pct), cls(row.volume_pct)) +
-				nearVolumeBox('Near Bids Vol', row.near_bids_volume_str, row.near_bids_volume_avg, 'positive') +
-				nearVolumeBox('Near Asks Vol', row.near_asks_volume_str, row.near_asks_volume_avg, 'negative') +
+				nearVolumeBox('Near Asks Vol', row.near_asks_volume_str, row.near_asks_volume_avg, row.near_asks_volume_regime) +
+				nearVolumeBox('Near Bids Vol', row.near_bids_volume_str, row.near_bids_volume_avg, row.near_bids_volume_regime) +
 				spreadBox('Spread', row.spread, row.spread_avg, row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), 'neutral') +
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
@@ -1109,40 +1111,42 @@ func (d *Dashboard) getDashboardData() DashboardData {
 		bidPrices, askPrices := splitBidAskPricePairs(prices)
 		sampleTime := latestPriceTime(bidPrices, askPrices)
 		row := DashboardPairData{
-			Exchange:          exchangeName,
-			Symbol:            t.Pair,
-			PriceDecimals:     priceDecimals,
-			MarkPrice:         t.MarkPrice,
-			MidPrice:          midPrice,
-			SpreadAvg:         t.spreadAvg,
-			Spread:            spread,
-			SpreadRegime:      t.spreadRegime,
-			SlippageAvg:       t.slippageAvg,
-			VPOC:              t.vpoc,
-			VolumePct:         t.volumePct,
-			NearBidsVolumeStr: t.nearBidsVolumeStr,
-			NearBidsVolumeAvg: t.nearBidsVolumeAvg,
-			NearAsksVolumeStr: t.nearAsksVolumeStr,
-			NearAsksVolumeAvg: t.nearAsksVolumeAvg,
-			VolatilityPct:     t.volatilityPct,
-			VolatilityRegime:  t.volatilityRegime,
-			TradesPerMinute:   t.tradePerMinute,
-			OpenInterest:      int64(t.openInterest),
-			FundingRate:       t.fundingRate,
-			M1_SMA20:          t.m1_SMA20,
-			M1_SMA20Slope:     t.m1_SMA20Slope,
-			M1_SMA200:         t.m1_SMA200,
-			M1_SMA200Slope:    t.m1_SMA200Slope,
-			BidPrices:         bidPrices,
-			AskPrices:         askPrices,
-			MarkPrices:        dashboardPricePoint(t.MarkPrice, sampleTime),
-			M1SMA20Prices:     dashboardPricePoint(t.m1_SMA20, sampleTime),
-			M1SMA200Prices:    dashboardPricePoint(t.m1_SMA200, sampleTime),
-			OBBidLevels:       obBids,
-			OBAskLevels:       obAsks,
-			OBMinPrice:        obMinPrice,
-			OBMaxPrice:        obMaxPrice,
-			Trades:            tradePricePoints(t.Trades),
+			Exchange:             exchangeName,
+			Symbol:               t.Pair,
+			PriceDecimals:        priceDecimals,
+			MarkPrice:            t.MarkPrice,
+			MidPrice:             midPrice,
+			SpreadAvg:            t.spreadAvg,
+			Spread:               spread,
+			SpreadRegime:         spreadRegime(t.spreadAvg),
+			SlippageAvg:          t.slippageAvg,
+			VPOC:                 t.vpoc,
+			VolumePct:            t.volumePct,
+			NearBidsVolumeStr:    t.nearBidsVolumeStr,
+			NearBidsVolumeAvg:    t.nearBidsVolumeAvg,
+			NearBidsVolumeRegime: nearVolumeRegime(t.nearBidsVolumeStr),
+			NearAsksVolumeStr:    t.nearAsksVolumeStr,
+			NearAsksVolumeAvg:    t.nearAsksVolumeAvg,
+			NearAsksVolumeRegime: nearVolumeRegime(t.nearAsksVolumeStr),
+			VolatilityPct:        t.volatilityPct,
+			VolatilityRegime:     volatilityRegime(t.volatilityPct),
+			TradesPerMinute:      t.tradePerMinute,
+			OpenInterest:         int64(t.openInterest),
+			FundingRate:          t.fundingRate,
+			M1_SMA20:             t.m1_SMA20,
+			M1_SMA20Slope:        t.m1_SMA20Slope,
+			M1_SMA200:            t.m1_SMA200,
+			M1_SMA200Slope:       t.m1_SMA200Slope,
+			BidPrices:            bidPrices,
+			AskPrices:            askPrices,
+			MarkPrices:           dashboardPricePoint(t.MarkPrice, sampleTime),
+			M1SMA20Prices:        dashboardPricePoint(t.m1_SMA20, sampleTime),
+			M1SMA200Prices:       dashboardPricePoint(t.m1_SMA200, sampleTime),
+			OBBidLevels:          obBids,
+			OBAskLevels:          obAsks,
+			OBMinPrice:           obMinPrice,
+			OBMaxPrice:           obMaxPrice,
+			Trades:               tradePricePoints(t.Trades),
 		}
 		t.RUnlock()
 

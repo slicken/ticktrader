@@ -17,6 +17,7 @@ const (
 
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
+	SLIPPAGE_WEIGHT_FACTOR = 0.0  // 0 = simple average; 0 - 1 = exponential weighting; 1 = only most recent sample
 	LATENCY_MIN_BUFFER_PCT = 0.01 // Minimum pct price buffer to account for latency when placing orders
 	LATENCY_EMA_ALPHA      = 0.05 // EMA alpha for latencyBufferPct (calculateLatencyBufferPct in updatePrices)
 
@@ -34,10 +35,13 @@ const (
 	ORDERBOOK_LEVEL             = 200   // How many orderbook levels to pull/analyze when reading book data
 	ORDERBOOK_DEPTH_PCT         = 0.5   // Only analyse orders within this percent depth from mid on each side
 	ORDERBOOK_WEIGHT_FACTOR     = 0.0   // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
-	ORDERBOOK_NEAR_DEPTH_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
-	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01  // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
 	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
 	ORDERBOOK_VPOC_DECAY_FACTOR = 0.92  // 0 = Disabled. 1 = 100%
+	ORDERBOOK_NEAR_DEPTH_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
+	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01  // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
+	ORDERBOOK_NEAR_NORMAL_PCT   = 35    // Threshold for normal near-volume regime (strength index); below = low
+	ORDERBOOK_NEAR_HIGH_PCT     = 165   // Threshold for high near-volume regime (strength index)
+	ORDERBOOK_NEAR_EXTREME_PCT  = 250   // Threshold for extreme near-volume regime (strength index)
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
@@ -58,7 +62,6 @@ type trader struct {
 	slippagePct       []float64
 	slippageAvg       float64
 	spreadAvg         float64
-	spreadRegime      string
 	MarkPrice         float64
 	Price             float64
 	bestBid           float64
@@ -73,7 +76,6 @@ type trader struct {
 	vpoc              float64
 	vpocProfile       VPOCProfile
 	volatilityPct     float64
-	volatilityRegime  string
 	latencyBufferPct  float64
 	tradePerMinute    int
 	lastTradePrice    float64
@@ -185,7 +187,6 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		slippagePct:       make([]float64, 0, ARRAY_SIZE),
 		slippageAvg:       0,
 		spreadAvg:         0,
-		spreadRegime:      "low",
 		MarkPrice:         0,
 		Price:             0,
 		bestBid:           0,
@@ -200,7 +201,6 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		vpoc:              0,
 		vpocProfile:       VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
 		volatilityPct:     0,
-		volatilityRegime:  "low",
 		latencyBufferPct:  0,
 		tradePerMinute:    0,
 		lastTradePrice:    0,
