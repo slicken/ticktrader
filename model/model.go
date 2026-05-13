@@ -35,7 +35,7 @@ const (
 	ORDERBOOK_DEPTH_PCT         = 0.5   // Only analyse orders within this percent depth from mid on each side
 	ORDERBOOK_WEIGHT_FACTOR     = 0.0   // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
 	ORDERBOOK_NEAR_DEPTH_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
-	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01  // EMA alpha for nearVolumeAvg baseline (strongest near notional in updateVolumes)
+	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01  // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
 	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
 	ORDERBOOK_VPOC_DECAY_FACTOR = 0.92  // 0 = Disabled. 1 = 100%
 )
@@ -50,37 +50,39 @@ type Marketmaker struct {
 
 // trader is a pair-specific tradingg instance with its own world/settings
 type trader struct {
-	parent             *Marketmaker
-	Pair               string
-	Bars               []exchange.Bar
-	Trades             []exchange.Trade
-	Prices             [][2]exchange.Price
-	slippagePct        []float64
-	slippageAvg        float64
-	spreadAvg          float64
-	spreadRegime       string
-	MarkPrice          float64
-	Price              float64
-	bestBid            float64
-	bestAsk            float64
-	asksVol            float64
-	bidsVol            float64
-	volumePct          float64
-	nearVolumeStrength float64
-	nearVolumeAvg      float64
-	vpoc               float64
-	vpocProfile        VPOCProfile
-	volatilityPct      float64
-	volatilityRegime   string
-	latencyBufferPct   float64
-	tradePerMinute     int
-	lastTradePrice     float64
-	openInterest       float64
-	fundingRate        float64
-	m1_SMA20           float64
-	m1_SMA20Slope      float64
-	m1_SMA200          float64
-	m1_SMA200Slope     float64
+	parent            *Marketmaker
+	Pair              string
+	Bars              []exchange.Bar
+	Trades            []exchange.Trade
+	Prices            [][2]exchange.Price
+	slippagePct       []float64
+	slippageAvg       float64
+	spreadAvg         float64
+	spreadRegime      string
+	MarkPrice         float64
+	Price             float64
+	bestBid           float64
+	bestAsk           float64
+	asksVol           float64
+	bidsVol           float64
+	volumePct         float64
+	nearBidsVolumeStr float64
+	nearBidsVolumeAvg float64
+	nearAsksVolumeStr float64
+	nearAsksVolumeAvg float64
+	vpoc              float64
+	vpocProfile       VPOCProfile
+	volatilityPct     float64
+	volatilityRegime  string
+	latencyBufferPct  float64
+	tradePerMinute    int
+	lastTradePrice    float64
+	openInterest      float64
+	fundingRate       float64
+	m1_SMA20          float64
+	m1_SMA20Slope     float64
+	m1_SMA200         float64
+	m1_SMA200Slope    float64
 	sync.RWMutex
 }
 
@@ -175,37 +177,39 @@ func Initialize(exch exchange.I, cfg *config.ModelConfig) *Marketmaker {
 // Newtrader creates a new pair-specific trading instance
 func Newtrader(parent *Marketmaker, pair string) *trader {
 	return &trader{
-		parent:             parent,
-		Pair:               pair,
-		Bars:               make([]exchange.Bar, 0, ARRAY_SIZE),
-		Trades:             make([]exchange.Trade, 0, ARRAY_SIZE),
-		Prices:             make([][2]exchange.Price, 0, ARRAY_SIZE),
-		slippagePct:        make([]float64, 0, ARRAY_SIZE),
-		slippageAvg:        0,
-		spreadAvg:          0,
-		spreadRegime:       "low",
-		MarkPrice:          0,
-		Price:              0,
-		bestBid:            0,
-		bestAsk:            0,
-		asksVol:            0,
-		bidsVol:            0,
-		volumePct:          0,
-		nearVolumeStrength: 0,
-		nearVolumeAvg:      0,
-		vpoc:               0,
-		vpocProfile:        VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
-		volatilityPct:      0,
-		volatilityRegime:   "low",
-		latencyBufferPct:   0,
-		tradePerMinute:     0,
-		lastTradePrice:     0,
-		openInterest:       0,
-		fundingRate:        0,
-		m1_SMA20:           0,
-		m1_SMA20Slope:      0,
-		m1_SMA200:          0,
-		m1_SMA200Slope:     0,
+		parent:            parent,
+		Pair:              pair,
+		Bars:              make([]exchange.Bar, 0, ARRAY_SIZE),
+		Trades:            make([]exchange.Trade, 0, ARRAY_SIZE),
+		Prices:            make([][2]exchange.Price, 0, ARRAY_SIZE),
+		slippagePct:       make([]float64, 0, ARRAY_SIZE),
+		slippageAvg:       0,
+		spreadAvg:         0,
+		spreadRegime:      "low",
+		MarkPrice:         0,
+		Price:             0,
+		bestBid:           0,
+		bestAsk:           0,
+		asksVol:           0,
+		bidsVol:           0,
+		volumePct:         0,
+		nearBidsVolumeStr: 0,
+		nearBidsVolumeAvg: 0,
+		nearAsksVolumeStr: 0,
+		nearAsksVolumeAvg: 0,
+		vpoc:              0,
+		vpocProfile:       VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
+		volatilityPct:     0,
+		volatilityRegime:  "low",
+		latencyBufferPct:  0,
+		tradePerMinute:    0,
+		lastTradePrice:    0,
+		openInterest:      0,
+		fundingRate:       0,
+		m1_SMA20:          0,
+		m1_SMA20Slope:     0,
+		m1_SMA200:         0,
+		m1_SMA200Slope:    0,
 	}
 }
 

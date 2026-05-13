@@ -136,13 +136,14 @@ func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
 	t.Lock()
 	defer t.Unlock()
 
-	strongestNearNotional := math.Max(bidNearNotional, askNearNotional)
-	t.nearVolumeAvg = EMA(strongestNearNotional, t.nearVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
+	t.nearBidsVolumeAvg = EMA(bidNearNotional, t.nearBidsVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
+	t.nearAsksVolumeAvg = EMA(askNearNotional, t.nearAsksVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
+	t.nearBidsVolumeStr = nearSideVolumeStrength(bidNearNotional, t.nearBidsVolumeAvg)
+	t.nearAsksVolumeStr = nearSideVolumeStrength(askNearNotional, t.nearAsksVolumeAvg)
 
 	t.asksVol = asksVol
 	t.bidsVol = bidsVol
 	t.volumePct = volumePct
-	t.nearVolumeStrength = calculateNearVolumeStrength(bidNearNotional, askNearNotional, t.nearVolumeAvg)
 	t.vpoc = vpoc
 }
 
@@ -281,19 +282,11 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, vpoc
 }
 
-func calculateNearVolumeStrength(bidNearNotional, askNearNotional, averageNearNotional float64) float64 {
-	if averageNearNotional <= 0 {
+func nearSideVolumeStrength(sideNearNotional, sideNearEMA float64) float64 {
+	if sideNearEMA <= 0 {
 		return 0
 	}
-	strongest := math.Max(bidNearNotional, askNearNotional)
-	strength := (strongest / averageNearNotional) * 100
-	if askNearNotional > bidNearNotional {
-		return -strength
-	}
-	if bidNearNotional > askNearNotional {
-		return strength
-	}
-	return 0
+	return (sideNearNotional / sideNearEMA) * 100
 }
 
 type VPOCProfile struct {
@@ -334,11 +327,7 @@ func (t *trader) updateTrade(trade *exchange.Trade) {
 
 	insertWithLimitInPlace(&t.Trades, *trade, ARRAY_SIZE)
 	t.tradePerMinute = t.calculateTradesInDuration(time.Minute)
-	side := ""
-	if trade.Order != nil {
-		side = trade.Order.Side
-	}
-	t.calculateSlippage(trade.Fills, side)
+	t.calculateSlippage(trade)
 }
 
 // calculateTradesInDuration calculates the number of stored trades inside duration.
@@ -382,55 +371,64 @@ func (t *trader) calculateTradesInDuration(duration time.Duration) int {
 	return count
 }
 
-// calculateSlippage records price impact versus mark price based on trade fills.
+// calculateSlippage records % distance from best ask (buys) or best bid (sells) to the worst fill (always non-negative).
 // The caller must hold t.Lock.
-func (t *trader) calculateSlippage(fills []*exchange.Fill, side string) {
-	if len(fills) == 0 || t.MarkPrice <= 0 {
+func (t *trader) calculateSlippage(trade *exchange.Trade) {
+	if trade == nil || len(trade.Fills) == 0 {
 		return
 	}
 
-	side = strings.ToLower(side)
-	if side != "buy" && side != "sell" {
-		return
+	side := ""
+	if trade.Order != nil {
+		switch strings.ToLower(trade.Order.Side) {
+		case "buy", "sell":
+			side = strings.ToLower(trade.Order.Side)
+		}
 	}
 
-	var worstFillPrice float64
-	for _, fill := range fills {
+	var worst float64
+	for _, fill := range trade.Fills {
 		if fill == nil || fill.Price <= 0 || fill.Size <= 0 {
 			continue
 		}
+		if side != "buy" && side != "sell" {
+			switch strings.ToLower(fill.Side) {
+			case "buy", "sell":
+				side = strings.ToLower(fill.Side)
+			}
+		}
 		switch side {
 		case "buy":
-			if fill.Price > worstFillPrice {
-				worstFillPrice = fill.Price
+			if fill.Price > worst {
+				worst = fill.Price
 			}
 		case "sell":
-			if worstFillPrice == 0 || fill.Price < worstFillPrice {
-				worstFillPrice = fill.Price
+			if worst == 0 || fill.Price < worst {
+				worst = fill.Price
 			}
 		}
 	}
 
-	if worstFillPrice <= 0 {
+	if (side != "buy" && side != "sell") || worst <= 0 {
 		return
 	}
 
-	var slippagePct float64
+	var ref float64
 	if side == "buy" {
-		slippagePct = ((worstFillPrice - t.MarkPrice) / t.MarkPrice) * 100
+		ref = t.bestAsk
 	} else {
-		slippagePct = -((t.MarkPrice - worstFillPrice) / t.MarkPrice) * 100
+		ref = t.bestBid
 	}
-
-	if math.Abs(slippagePct) < 0.01 {
+	if ref <= 0 {
 		return
 	}
 
+	slippagePct := math.Abs((worst-ref)/ref) * 100
 	insertWithLimitInPlace(&t.slippagePct, slippagePct, ARRAY_SIZE)
 	t.updateSlippageAvg()
 }
 
-// updateSlippageAvg recalculates weighted rolling slippage percentage.
+// updateSlippageAvg recalculates weighted rolling average slippage magnitude (% from book touch to fills).
 // The caller must hold t.Lock.
 func (t *trader) updateSlippageAvg() {
 	n := len(t.slippagePct)
