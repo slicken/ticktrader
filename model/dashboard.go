@@ -440,7 +440,10 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 					animation: false,
 					interaction: { mode: 'nearest', intersect: false },
 					plugins: {
-						legend: { labels: { color: '#d1d5db' } },
+						legend: {
+							align: 'start',
+							labels: { color: '#d1d5db' },
+						},
 						tooltip: {
 							callbacks: {
 								label: ctx => {
