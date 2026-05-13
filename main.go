@@ -21,7 +21,7 @@ var (
 	configFile    = "config.json"
 	dashboardAddr = ":8080"
 	exch          exchange.I
-	mmodel        *model.Marketmaker
+	modl          *model.Marketmaker
 	dashboard     *model.Dashboard
 )
 
@@ -61,11 +61,11 @@ func main() {
 	}
 
 	log.Println("Loading model...")
-	mmodel = model.Initialize(exch, &cfg.Model)
-	go mmodel.Start(ctx)
+	modl = model.Initialize(exch, &cfg.Model)
+	go modl.Start(ctx)
 
 	log.Printf("Starting dashboard [http://localhost%s]", dashboardAddr)
-	dashboard = model.NewDashboard(mmodel, dashboardAddr)
+	dashboard = model.NewDashboard(modl, dashboardAddr)
 	go dashboard.Start(ctx)
 
 	// handle graceful shutdown

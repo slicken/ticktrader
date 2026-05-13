@@ -10,9 +10,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 	"ticktrader/config"
 	"ticktrader/exchange"
+	"time"
 
 	lighterapi "github.com/defi-maker/golighter/client"
 	lighterclient "github.com/elliottech/lighter-go/client"

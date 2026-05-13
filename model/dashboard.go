@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 	"ticktrader/exchange"
+	"time"
 )
 
 const (
@@ -64,6 +64,8 @@ type DashboardPairData struct {
 	SpreadRegime         string                `json:"spread_regime"`
 	SlippageAvg          float64               `json:"slippage_avg"`
 	VPOC                 float64               `json:"vpoc"`
+	VpocRatio            float64               `json:"vpoc_ratio"`
+	VpocRegime           string                `json:"vpoc_regime"`
 	VolumePct            float64               `json:"volume_pct"`
 	NearBidsVolumeStr    float64               `json:"near_bids_volume_str"`
 	NearBidsVolumeAvg    float64               `json:"near_bids_volume_avg"`
@@ -630,7 +632,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			return '<div class="metric">' +
 				'<div class="metric-label metric-label-row"><span>' + label + '</span>' + regimeLegendHtml() + '</div>' +
 				'<div class="metric-value ' + regimeClass(regime) + '">' + pct(strVal) + '</div>' +
-				'<div class="metric-value compact ' + regimeClass(regime) + ' near-volume-avg-line">avg ' + fmt(avgVal, 2) + '</div>' +
+				'<div class="metric-value compact neutral near-volume-avg-line">avg ' + fmt(avgVal, 2) + '</div>' +
 			'</div>';
 		}
 
@@ -645,8 +647,32 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		function smaBox(label, priceVal, slopeVal, digits) {
 			return '<div class="metric">' +
 				'<div class="metric-label">' + label + '</div>' +
-				'<div class="metric-value neutral">' + fmtPrice(priceVal, digits) + '</div>' +
-				'<div class="metric-value compact ' + cls(slopeVal) + ' near-volume-avg-line">slope ' + pct(slopeVal) + '</div>' +
+				'<div class="metric-value ' + cls(slopeVal) + '">' + fmtPrice(priceVal, digits) + '</div>' +
+				'<div class="metric-value compact neutral near-volume-avg-line">slope ' + pct(slopeVal) + '</div>' +
+				'</div>';
+		}
+
+		function vpocChartStyle(regime) {
+			switch(regime || 'normal') {
+				case 'extreme':
+					return { borderColor: '#f87171', backgroundColor: 'rgba(248, 113, 113, 0.10)' };
+				case 'high':
+					return { borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.10)' };
+				case 'normal':
+					return { borderColor: '#d1d5db', backgroundColor: 'rgba(209, 213, 219, 0.10)' };
+				default:
+					return { borderColor: '#4ade80', backgroundColor: 'rgba(74, 222, 128, 0.10)' };
+			}
+		}
+
+		function vpocBox(priceVal, ratioVal, regime, digits) {
+			const val = priceVal > 0 ? fmtPrice(priceVal, digits) : '—';
+			const r = Number(ratioVal);
+			const sub = (Number.isFinite(r) && r > 0) ? (fmt(r, 2) + 'x') : '—';
+			return '<div class="metric">' +
+				'<div class="metric-label metric-label-row"><span>OB VPOC</span>' + regimeLegendHtml() + '</div>' +
+				'<div class="metric-value ' + regimeClass(regime || 'normal') + '">' + val + '</div>' +
+				'<div class="metric-value compact neutral near-volume-avg-line">' + sub + '</div>' +
 			'</div>';
 		}
 
@@ -658,7 +684,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>' +
 			'<div class="metric-grid">' +
 				compactMetric('OB Depth ' + ORDERBOOK_DEPTH_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
-				metric('OB VPOC', fmtPrice(row.vpoc, digits)) +
+				vpocBox(row.vpoc, row.vpoc_ratio, row.vpoc_regime, digits) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imbalance', pct(row.volume_pct), cls(row.volume_pct)) +
 				nearVolumeBox('Near Asks Vol', row.near_asks_volume_str, row.near_asks_volume_avg, row.near_asks_volume_regime) +
@@ -745,6 +771,9 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[4].label = 'SMA200';
 			chart.data.datasets[5].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
 			chart.data.datasets[5].label = 'VPOC';
+			const vpStyle = vpocChartStyle(row.vpoc_regime);
+			chart.data.datasets[5].borderColor = vpStyle.borderColor;
+			chart.data.datasets[5].backgroundColor = vpStyle.backgroundColor;
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
 			chart.data.datasets[6].data = tradeAlign.prices;
 			chart.data.datasets[6].tradeSizes = tradeAlign.sizes;
@@ -1121,6 +1150,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			SpreadRegime:         spreadRegime(t.spreadAvg),
 			SlippageAvg:          t.slippageAvg,
 			VPOC:                 t.vpoc,
+			VpocRatio:            t.vpocRatio,
+			VpocRegime:           vpocRegime(t.vpoc, t.vpocRatio),
 			VolumePct:            t.volumePct,
 			NearBidsVolumeStr:    t.nearBidsVolumeStr,
 			NearBidsVolumeAvg:    t.nearBidsVolumeAvg,

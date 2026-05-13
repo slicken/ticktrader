@@ -6,15 +6,14 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
-	"time"
 	"ticktrader/config"
 	"ticktrader/exchange"
 	"ticktrader/exchange/lighter"
+	"time"
 )
 
 const (
 	// pct values are real percentage values, not rations. (eg. 1 = 1%, 0.5 = 0.5%)
-
 	ARRAY_SIZE             = 200  // Max number of recent bars/trades/prices to store in arrays
 	BAR_INTERVAL           = "1m" // Resolution for bar (candlestick) data, e.g. "1m" = 1 minute bars
 	SLIPPAGE_WEIGHT_FACTOR = 0.0  // 0 = simple average; 0 - 1 = exponential weighting; 1 = only most recent sample
@@ -32,22 +31,28 @@ const (
 	SPREAD_HIGH_PCT    = 0.02  // Threshold for "high" spread regime, as a pct of price
 	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
 
-	ORDERBOOK_LEVEL             = 200  // How many orderbook levels to pull/analyze when reading book data
-	ORDERBOOK_DEPTH_PCT         = 0.5  // Only analyse orders within this percent depth from mid on each side
-	ORDERBOOK_WEIGHT_FACTOR     = 0.0  // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
-	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
-	ORDERBOOK_VPOC_DECAY_FACTOR = 0.92 // 0 = Disabled. 1 = 100%
-	ORDERBOOK_NEAR_DEPTH_PCT    = 0.01 // How far from best bid/ask to analyze near-book volume, as a pct of price
-	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01 // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
-	ORDERBOOK_NEAR_NORMAL_PCT   = 35   // Threshold for normal near-volume regime (strength index); below = low
-	ORDERBOOK_NEAR_HIGH_PCT     = 165  // Threshold for high near-volume regime (strength index)
-	ORDERBOOK_NEAR_EXTREME_PCT  = 250  // Threshold for extreme near-volume regime (strength index)
+	ORDERBOOK_LEVEL         = 200 // How many orderbook levels to pull/analyze when reading book data
+	ORDERBOOK_DEPTH_PCT     = 0.5 // Only analyse orders within this percent depth from mid on each side
+	ORDERBOOK_WEIGHT_FACTOR = 0.0 // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
+
+	ORDERBOOK_VPOC_BUCKET_PCT    = 0.01 // VPOC bucket width as percent of mid price
+	ORDERBOOK_VPOC_DECAY_FACTOR  = 0.92 // 0 = Disabled. 1 = 100%
+	ORDERBOOK_VPOC_NORMAL_RATIO  = 1.3  // ≥ this: normal-ish wall vs mean(second, third bucket); ratio < this → low (flat book)
+	ORDERBOOK_VPOC_HIGH_RATIO    = 1.8  // Clearly stronger concentration than everyday structure
+	ORDERBOOK_VPOC_EXTREME_RATIO = 2.6  // Rare: only standout huge walls / order clusters (raise further if extreme still too common)
+
+	ORDERBOOK_NEAR_DEPTH_PCT   = 0.01 // How far from best bid/ask to analyze near-book volume, as a pct of price
+	ORDERBOOK_NEAR_EMA_ALPHA   = 0.01 // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
+	ORDERBOOK_NEAR_NORMAL_PCT  = 35   // Threshold for normal near-volume regime (strength index); below = low
+	ORDERBOOK_NEAR_HIGH_PCT    = 165  // Threshold for high near-volume regime (strength index)
+	ORDERBOOK_NEAR_EXTREME_PCT = 250  // Threshold for extreme near-volume regime (strength index)
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config
 type Marketmaker struct {
 	Exchange exchange.I
 	config   *config.ModelConfig
+	Cfg      *config.Config // full app cfg; Model is read for pair filter and reloads when dynamic config is on
 	traders  map[string]*trader
 	process  chan struct{} // Channel semaphore to ensure only one instance runs at a time
 }
@@ -70,10 +75,11 @@ type trader struct {
 	bidsVol           float64
 	volumePct         float64
 	nearBidsVolumeStr float64
-	nearBidsVolumeAvg float64
+	nearBidsVolumeAvg float64 // EMA of near bid-side notional
 	nearAsksVolumeStr float64
-	nearAsksVolumeAvg float64
+	nearAsksVolumeAvg float64 // EMA of near ask-side notional (strength uses avg of bid+ask EMA as baseline)
 	vpoc              float64
+	vpocRatio         float64 // dominant bucket vs combined 2nd+3rd in depth band (dashboard / regime)
 	vpocProfile       VPOCProfile
 	volatilityPct     float64
 	latencyBufferPct  float64
@@ -199,6 +205,7 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		nearAsksVolumeStr: 0,
 		nearAsksVolumeAvg: 0,
 		vpoc:              0,
+		vpocRatio:         0,
 		vpocProfile:       VPOCProfile{DecayFactor: ORDERBOOK_VPOC_DECAY_FACTOR},
 		volatilityPct:     0,
 		latencyBufferPct:  0,
@@ -322,10 +329,13 @@ func (strat *Marketmaker) Stop() {
 	strat.traders = nil
 	strat.Exchange = nil
 	strat.config = nil
+	strat.Exchange = nil
+	strat.Cfg = nil
 	log.Println("Marketmaker stopped!")
 }
 
 func (strat *Marketmaker) update() {
+
 }
 
 func (strat *Marketmaker) closeInstantProfitPosition(pos *exchange.Position) {

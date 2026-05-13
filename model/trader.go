@@ -2,9 +2,10 @@ package model
 
 import (
 	"math"
+	"sort"
 	"strings"
-	"time"
 	"ticktrader/exchange"
+	"time"
 )
 
 func (t *trader) updatePair(pair *exchange.Pair) {
@@ -125,6 +126,79 @@ func nearVolumeRegime(strength float64) string {
 	}
 }
 
+func vpocRegime(vpoc float64, vsNextTwoRatio float64) string {
+	if vpoc <= 0 || vsNextTwoRatio <= 0 {
+		return "normal"
+	}
+	switch {
+	case vsNextTwoRatio >= ORDERBOOK_VPOC_EXTREME_RATIO:
+		return "extreme"
+	case vsNextTwoRatio >= ORDERBOOK_VPOC_HIGH_RATIO:
+		return "high"
+	case vsNextTwoRatio >= ORDERBOOK_VPOC_NORMAL_RATIO:
+		return "normal"
+	default:
+		return "low"
+	}
+}
+
+type vpocBucketEntry struct {
+	idx int64
+	vol float64
+}
+
+// vpocRatioFromBuckets is VPoc bucket notional / mean(notional of next two largest buckets, excluding vpocBucketIdx).
+// With only one other bucket, the mean is that bucket alone (not ÷2).
+// Same global bucket map as VPoc's bestIdx choice.
+func vpocRatioFromBuckets(vpocBucketIdx int64, buckets map[int64]float64) float64 {
+	if buckets == nil {
+		return 0
+	}
+	top := buckets[vpocBucketIdx]
+	if top <= 1e-9 {
+		return 0
+	}
+	var ents []vpocBucketEntry
+	for idx, vol := range buckets {
+		if vol <= 1e-9 {
+			continue
+		}
+		ents = append(ents, vpocBucketEntry{idx: idx, vol: vol})
+	}
+	if len(ents) <= 1 {
+		return 0
+	}
+	sort.Slice(ents, func(i, j int) bool {
+		if ents[i].vol != ents[j].vol {
+			return ents[i].vol > ents[j].vol
+		}
+		return ents[i].idx < ents[j].idx
+	})
+	var runners []float64
+	for _, e := range ents {
+		if e.idx == vpocBucketIdx {
+			continue
+		}
+		runners = append(runners, e.vol)
+		if len(runners) == 2 {
+			break
+		}
+	}
+	if len(runners) == 0 {
+		return 0
+	}
+	var baseline float64
+	if len(runners) == 1 {
+		baseline = runners[0]
+	} else {
+		baseline = (runners[0] + runners[1]) / 2
+	}
+	if baseline <= 1e-9 {
+		return 0
+	}
+	return top / baseline
+}
+
 func midPrice(pricePair [2]exchange.Price) float64 {
 	bid := pricePair[0].Price
 	ask := pricePair[1].Price
@@ -142,30 +216,38 @@ func pricePairTime(pricePair [2]exchange.Price) time.Time {
 }
 
 func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
-	asksVol, bidsVol, volumePct, bidNearNotional, askNearNotional, vpoc := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
+	asksVol, bidsVol, volumePct, bidNearNotional, askNearNotional, vpoc, vpRat := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
 
 	t.Lock()
 	defer t.Unlock()
 
 	t.nearBidsVolumeAvg = EMA(bidNearNotional, t.nearBidsVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
 	t.nearAsksVolumeAvg = EMA(askNearNotional, t.nearAsksVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
-	t.nearBidsVolumeStr = nearSideVolumeStrength(bidNearNotional, t.nearBidsVolumeAvg)
-	t.nearAsksVolumeStr = nearSideVolumeStrength(askNearNotional, t.nearAsksVolumeAvg)
+	// strenght calculation uses combined avg of bid and ask volumes as baseline
+	base := (t.nearBidsVolumeAvg + t.nearAsksVolumeAvg) / 2
+	if base <= 0 {
+		t.nearBidsVolumeStr = 0
+		t.nearAsksVolumeStr = 0
+	} else {
+		t.nearBidsVolumeStr = (bidNearNotional / base) * 100
+		t.nearAsksVolumeStr = (askNearNotional / base) * 100
+	}
 
 	t.asksVol = asksVol
 	t.bidsVol = bidsVol
 	t.volumePct = volumePct
 	t.vpoc = vpoc
+	t.vpocRatio = vpRat
 }
 
-func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64, float64, float64, float64, float64, float64) {
+func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol, bidsVol, imb, bidNear, askNear, vpoc, vpRat float64) {
 	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-		return 0, 0, 0, 0, 0, 0
+		return
 	}
 
 	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
 	if mid <= 0 {
-		return 0, 0, 0, 0, 0, 0
+		return
 	}
 
 	tickSize := 0.0
@@ -175,7 +257,6 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 		}
 	}
 
-	// VPOC buckets group nearby price levels. A positive decay factor keeps a
 	// decayed profile; zero or lower uses only the current orderbook snapshot.
 	if t.vpocProfile.BucketSize <= 0 && tickSize > 0 {
 		t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
@@ -266,7 +347,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	}
 
 	if !vpocEnabled {
-		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0
+		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
 	}
 
 	// VPOC is the highest-volume price level inside the single highest-volume bucket.
@@ -283,21 +364,16 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (float64
 	}
 
 	if maxBucketVolume <= 0 {
-		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0
+		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
 	}
 
-	vpoc := vpocBucketPrice[bestIdx].Price
-	if vpoc <= 0 {
-		vpoc = (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
+	price := vpocBucketPrice[bestIdx].Price
+	if price <= 0 {
+		price = (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
 	}
-	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, vpoc
-}
 
-func nearSideVolumeStrength(sideNearNotional, sideNearEMA float64) float64 {
-	if sideNearEMA <= 0 {
-		return 0
-	}
-	return (sideNearNotional / sideNearEMA) * 100
+	vpRat = vpocRatioFromBuckets(bestIdx, vpocBuckets)
+	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, price, vpRat
 }
 
 type VPOCProfile struct {

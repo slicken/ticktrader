@@ -12,8 +12,8 @@ import (
 
 // Config holds all configuration parameters
 type Config struct {
-	DynamicConfig bool             `json:"enable_dynamic_config,omitempty"`
-	Exchanges     []ExchangeConfig `json:"exchanges"` // Required
+	DynamicConfig bool             `json:"enable_dynamic_config,omitempty"` // If config file gets updated, reload the config.
+	Exchanges     []ExchangeConfig `json:"exchanges"`                       // Required
 	Model         ModelConfig      `json:"model,omitempty"`
 }
 
@@ -29,10 +29,16 @@ type ExchangeConfig struct {
 	Debug       bool   `json:"debug,omitempty"` // Enable debug logging for orders and positions
 }
 
-// ModelConfig holds all model parameters
+// DashboardConfig configures the HTTP dashboard (all fields optional).
+type DashboardConfig struct {
+	ChartWindow     string  `json:"chart_window,omitempty"`
+	RefreshInterval string  `json:"refresh_interval,omitempty"`
+	ChartScaleRatio float64 `json:"chart_scale_ratio,omitempty"`
+}
+
+// ModelConfig configures the market model (optional).
 type ModelConfig struct {
-	// Trading Pair Parameters
-	Pairs []string `json:"pairs"` // Trading pairs (e.g., ["BTC", "ETH", "SOL"])
+	Pairs []string `json:"pairs,omitempty"`
 }
 
 // LoadConfig loads configuration from a file
@@ -50,44 +56,42 @@ func LoadConfig(path string, ctx context.Context) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Start config reloader goroutine
+	// Start config reloader goroutine if dynamic config is enabled
 	if cfg.DynamicConfig {
 		log.Println("Dynamic config is enabled. (reloading every minute)")
-
 		go func() {
 			ticker := time.NewTicker(time.Minute)
 			defer ticker.Stop()
 
-			var lastModTime time.Time
+			var lastSize int64
 			stat, err := os.Stat(path)
 			if err == nil {
-				lastModTime = stat.ModTime()
+				lastSize = stat.Size()
+			} else {
+				log.Printf("Failed to stat config file: %v\n", err)
 			}
 
 			for {
 				select {
 				case <-ticker.C:
-					// Check if file has been modified
 					stat, err := os.Stat(path)
 					if err != nil {
+						log.Printf("Failed to stat config file: %v\n", err)
 						continue
 					}
-
-					if stat.ModTime().After(lastModTime) {
-						// Reload config
+					size := stat.Size()
+					if size != lastSize {
 						newData, err := os.ReadFile(path)
 						if err != nil {
 							log.Printf("Failed to read config file: %v\n", err)
 							continue
 						}
-
 						if err := json.Unmarshal(newData, cfg); err != nil {
 							log.Printf("Failed to parse config file: %v\n", err)
 							continue
 						}
-
-						lastModTime = stat.ModTime()
-						log.Println("Config reloaded successfully")
+						lastSize = size
+						log.Println("Config reloaded successfully (file size changed)")
 					}
 				case <-ctx.Done():
 					return
@@ -97,6 +101,15 @@ func LoadConfig(path string, ctx context.Context) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// PrintConfig logs model-related settings from config.
+func PrintConfig(m *ModelConfig) {
+	if m != nil && len(m.Pairs) > 0 {
+		log.Printf("Model pair filter: %v", m.Pairs)
+		return
+	}
+	log.Println("Model pair filter: (none — subscribe all enabled perpetual pairs)")
 }
 
 func (sc *ModelConfig) Print() {
