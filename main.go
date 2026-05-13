@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"trader-mux/config"
-	"trader-mux/exchange"
-	"trader-mux/exchange/hyperliquid"
-	"trader-mux/exchange/lighter"
-	"trader-mux/model"
+	"ticktrader/config"
+	"ticktrader/exchange"
+	"ticktrader/exchange/hyperliquid"
+	"ticktrader/exchange/lighter"
+	"ticktrader/model"
 )
 
 var (

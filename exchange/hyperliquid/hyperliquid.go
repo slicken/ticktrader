@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"trader-mux/config"
-	"trader-mux/exchange"
+	"ticktrader/config"
+	"ticktrader/exchange"
 
 	hl "go_hyperliquid"
 )

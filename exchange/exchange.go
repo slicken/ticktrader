@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"trader-mux/config"
-	// "trader-mux/config"
+	"ticktrader/config"
 )
 
 type Exchange struct {

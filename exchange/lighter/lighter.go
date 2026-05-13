@@ -11,8 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"trader-mux/config"
-	"trader-mux/exchange"
+	"ticktrader/config"
+	"ticktrader/exchange"
 
 	lighterapi "github.com/defi-maker/golighter/client"
 	lighterclient "github.com/elliottech/lighter-go/client"

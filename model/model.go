@@ -7,9 +7,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"trader-mux/config"
-	"trader-mux/exchange"
-	"trader-mux/exchange/lighter"
+	"ticktrader/config"
+	"ticktrader/exchange"
+	"ticktrader/exchange/lighter"
 )
 
 const (
@@ -32,16 +32,16 @@ const (
 	SPREAD_HIGH_PCT    = 0.02  // Threshold for "high" spread regime, as a pct of price
 	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
 
-	ORDERBOOK_LEVEL             = 200   // How many orderbook levels to pull/analyze when reading book data
-	ORDERBOOK_DEPTH_PCT         = 0.5   // Only analyse orders within this percent depth from mid on each side
-	ORDERBOOK_WEIGHT_FACTOR     = 0.0   // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
-	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01  // VPOC bucket width as percent of mid price
-	ORDERBOOK_VPOC_DECAY_FACTOR = 0.92  // 0 = Disabled. 1 = 100%
-	ORDERBOOK_NEAR_DEPTH_PCT    = 0.015 // How far from best bid/ask to analyze near-book volume, as a pct of price
-	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01  // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
-	ORDERBOOK_NEAR_NORMAL_PCT   = 35    // Threshold for normal near-volume regime (strength index); below = low
-	ORDERBOOK_NEAR_HIGH_PCT     = 165   // Threshold for high near-volume regime (strength index)
-	ORDERBOOK_NEAR_EXTREME_PCT  = 250   // Threshold for extreme near-volume regime (strength index)
+	ORDERBOOK_LEVEL             = 200  // How many orderbook levels to pull/analyze when reading book data
+	ORDERBOOK_DEPTH_PCT         = 0.5  // Only analyse orders within this percent depth from mid on each side
+	ORDERBOOK_WEIGHT_FACTOR     = 0.0  // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
+	ORDERBOOK_VPOC_BUCKET_PCT   = 0.01 // VPOC bucket width as percent of mid price
+	ORDERBOOK_VPOC_DECAY_FACTOR = 0.92 // 0 = Disabled. 1 = 100%
+	ORDERBOOK_NEAR_DEPTH_PCT    = 0.01 // How far from best bid/ask to analyze near-book volume, as a pct of price
+	ORDERBOOK_NEAR_EMA_ALPHA    = 0.01 // EMA alpha for near-bids / near-asks notional baselines in updateVolumes
+	ORDERBOOK_NEAR_NORMAL_PCT   = 35   // Threshold for normal near-volume regime (strength index); below = low
+	ORDERBOOK_NEAR_HIGH_PCT     = 165  // Threshold for high near-volume regime (strength index)
+	ORDERBOOK_NEAR_EXTREME_PCT  = 250  // Threshold for extreme near-volume regime (strength index)
 )
 
 // Marketmaker is the main engine that manages exchange connection and global config

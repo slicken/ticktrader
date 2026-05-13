@@ -1,4 +1,4 @@
-module trader-mux
+module ticktrader
 
 go 1.24.1
 

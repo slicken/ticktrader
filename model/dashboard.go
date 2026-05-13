@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"trader-mux/exchange"
+	"ticktrader/exchange"
 )
 
 const (
@@ -139,7 +139,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 <!DOCTYPE html>
 <html>
 <head>
-	<title>Trader Mux Dashboard</title>
+	<title>Ticktrader Dashboard</title>
 	<meta charset="utf-8">
 	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 	<style>

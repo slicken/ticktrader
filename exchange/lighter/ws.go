@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"trader-mux/exchange"
+	"ticktrader/exchange"
 
 	lighterapi "github.com/defi-maker/golighter/client"
 	"github.com/gorilla/websocket"

@@ -4,7 +4,7 @@ import (
 	"math"
 	"strings"
 	"time"
-	"trader-mux/exchange"
+	"ticktrader/exchange"
 )
 
 func (t *trader) updatePair(pair *exchange.Pair) {

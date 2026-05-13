@@ -1,4 +1,4 @@
-# trader-mux
+# ticktrader
 
 ## Exchange Adapter
 
