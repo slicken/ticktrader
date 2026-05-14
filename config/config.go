@@ -45,30 +45,25 @@ type ModelConfig struct {
 func LoadConfig(path string, ctx context.Context) (*Config, error) {
 	cfg := &Config{}
 
-	// Read config file
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-
-	// Parse JSON
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
-
 	// Start config reloader goroutine if dynamic config is enabled
 	if cfg.DynamicConfig {
-		log.Println("Dynamic config is enabled. (reloading every minute)")
+		log.Println("Dynamic config is enabled (polls periodically; reloads when file modification time changes)")
 		go func() {
-			ticker := time.NewTicker(time.Minute)
+			ticker := time.NewTicker(3 * time.Second)
 			defer ticker.Stop()
 
-			var lastSize int64
-			stat, err := os.Stat(path)
-			if err == nil {
-				lastSize = stat.Size()
-			} else {
+			var lastMod time.Time
+			if stat, err := os.Stat(path); err != nil {
 				log.Printf("Failed to stat config file: %v\n", err)
+			} else {
+				lastMod = stat.ModTime()
 			}
 
 			for {
@@ -79,20 +74,20 @@ func LoadConfig(path string, ctx context.Context) (*Config, error) {
 						log.Printf("Failed to stat config file: %v\n", err)
 						continue
 					}
-					size := stat.Size()
-					if size != lastSize {
-						newData, err := os.ReadFile(path)
-						if err != nil {
-							log.Printf("Failed to read config file: %v\n", err)
-							continue
-						}
-						if err := json.Unmarshal(newData, cfg); err != nil {
-							log.Printf("Failed to parse config file: %v\n", err)
-							continue
-						}
-						lastSize = size
-						log.Println("Config reloaded successfully (file size changed)")
+					if stat.ModTime().Equal(lastMod) {
+						continue
 					}
+					newData, err := os.ReadFile(path)
+					if err != nil {
+						log.Printf("Failed to read config file: %v\n", err)
+						continue
+					}
+					if err := json.Unmarshal(newData, cfg); err != nil {
+						log.Printf("Failed to parse config file: %v\n", err)
+						continue
+					}
+					lastMod = stat.ModTime()
+					log.Println("Config reloaded successfully")
 				case <-ctx.Done():
 					return
 				}
