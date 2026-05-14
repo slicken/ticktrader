@@ -111,6 +111,48 @@ func NewDashboard(model *Marketmaker, addr string) *Dashboard {
 	}
 }
 
+// effectiveDashboardPrefs merges config.json dashboard.* with defaults from this package.
+// Chart scale follows config whenever chart_scale_ratio is non-zero (0 omits scaling = same as builtin default).
+func (d *Dashboard) effectiveDashboardPrefs() (chartWindowSec int, refreshMs int, chartScaleRatio float64) {
+	chartWindowSec = int(DASHBOARD_CHART_WINDOW / time.Second)
+	refreshMs = int(DASHBOARD_REFRESH_INTERVAL / time.Millisecond)
+	chartScaleRatio = CHART_SCALE_RATIO
+
+	if strat := d.model; strat != nil && strat.Cfg != nil {
+		dc := strat.Cfg.Dashboard
+		if dc.ChartScaleRatio != 0 {
+			chartScaleRatio = dc.ChartScaleRatio
+		}
+		if s := strings.TrimSpace(dc.ChartWindow); s != "" {
+			if dur, err := time.ParseDuration(s); err == nil && dur > 0 {
+				sec := int(dur / time.Second)
+				if sec < 1 {
+					sec = 1
+				}
+				chartWindowSec = sec
+			}
+		}
+		if s := strings.TrimSpace(dc.RefreshInterval); s != "" {
+			if dur, err := time.ParseDuration(s); err == nil && dur > 0 {
+				ms := int(dur / time.Millisecond)
+				if ms < 50 {
+					ms = 50
+				}
+				refreshMs = ms
+			}
+		}
+	}
+	return chartWindowSec, refreshMs, chartScaleRatio
+}
+
+func (d *Dashboard) chartWindowDuration() time.Duration {
+	sec, _, _ := d.effectiveDashboardPrefs()
+	if sec < 1 {
+		return DASHBOARD_CHART_WINDOW
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func (d *Dashboard) Start(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.dashboardHandler)
@@ -655,19 +697,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				'</div>';
 		}
 
-		function vpocChartStyle(regime) {
-			switch(regime || 'normal') {
-				case 'extreme':
-					return { borderColor: '#f87171', backgroundColor: 'rgba(248, 113, 113, 0.10)' };
-				case 'high':
-					return { borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.10)' };
-				case 'normal':
-					return { borderColor: '#d1d5db', backgroundColor: 'rgba(209, 213, 219, 0.10)' };
-				default:
-					return { borderColor: '#4ade80', backgroundColor: 'rgba(74, 222, 128, 0.10)' };
-			}
-		}
-
 		function vpocBox(priceVal, ratioVal, regime, digits) {
 			const val = priceVal > 0 ? fmtPrice(priceVal, digits) : '—';
 			const r = Number(ratioVal);
@@ -774,9 +803,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[4].label = 'SMA200';
 			chart.data.datasets[5].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
 			chart.data.datasets[5].label = 'VPOC';
-			const vpStyle = vpocChartStyle(row.vpoc_regime);
-			chart.data.datasets[5].borderColor = vpStyle.borderColor;
-			chart.data.datasets[5].backgroundColor = vpStyle.backgroundColor;
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
 			chart.data.datasets[6].data = tradeAlign.prices;
 			chart.data.datasets[6].tradeSizes = tradeAlign.sizes;
@@ -1077,10 +1103,11 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 </html>`
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	winSec, refMs, scale := d.effectiveDashboardPrefs()
 	data := dashboardTemplateData{
-		ChartWindowSeconds: int(DASHBOARD_CHART_WINDOW / time.Second),
-		RefreshMs:          int(DASHBOARD_REFRESH_INTERVAL / time.Millisecond),
-		ChartScaleRatio:    CHART_SCALE_RATIO,
+		ChartWindowSeconds: winSec,
+		RefreshMs:          refMs,
+		ChartScaleRatio:    scale,
 		NearDepthPct:       ORDERBOOK_NEAR_DEPTH_PCT,
 		OrderbookDepthPct:  ORDERBOOK_DEPTH_PCT,
 	}
@@ -1099,6 +1126,7 @@ func (d *Dashboard) apiHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) getDashboardData() DashboardData {
+	winSec, _, _ := d.effectiveDashboardPrefs()
 	rows := make([]DashboardPairData, 0)
 	latency := make(map[string]int64, 1)
 
@@ -1108,7 +1136,7 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			PairsData:          rows,
 			LastUpdate:         time.Now(),
 			LatencyMs:          latency,
-			ChartWindowSeconds: int(DASHBOARD_CHART_WINDOW / time.Second),
+			ChartWindowSeconds: winSec,
 		}
 	}
 
@@ -1199,7 +1227,7 @@ func (d *Dashboard) getDashboardData() DashboardData {
 		PairsData:          rows,
 		LastUpdate:         time.Now(),
 		LatencyMs:          latency,
-		ChartWindowSeconds: int(DASHBOARD_CHART_WINDOW / time.Second),
+		ChartWindowSeconds: winSec,
 	}
 }
 
@@ -1213,7 +1241,7 @@ func (d *Dashboard) applyHistory(key string, row *DashboardPairData) {
 		d.histories[key] = history
 	}
 
-	cutoff := time.Now().Add(-DASHBOARD_CHART_WINDOW)
+	cutoff := time.Now().Add(-d.chartWindowDuration())
 	incomingPairs := zipBidAskAligned(row.BidPrices, row.AskPrices)
 	history.PairedQuotes = trimDashboardQuotePairs(
 		mergeLatestQuotePairs(history.PairedQuotes, incomingPairs),

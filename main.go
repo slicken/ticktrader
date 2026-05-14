@@ -62,6 +62,7 @@ func main() {
 
 	log.Println("Loading model...")
 	modl = model.Initialize(exch, &cfg.Model)
+	modl.Cfg = cfg
 	go modl.Start(ctx)
 
 	log.Printf("Starting dashboard [http://localhost%s]", dashboardAddr)

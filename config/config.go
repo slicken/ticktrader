@@ -12,9 +12,10 @@ import (
 
 // Config holds all configuration parameters
 type Config struct {
-	DynamicConfig bool             `json:"enable_dynamic_config,omitempty"` // If config file gets updated, reload the config.
-	Exchanges     []ExchangeConfig `json:"exchanges"`                       // Required
-	Model         ModelConfig      `json:"model,omitempty"`
+	DynamicConfig bool               `json:"enable_dynamic_config,omitempty"` // If config file gets updated, reload the config.
+	Exchanges     []ExchangeConfig   `json:"exchanges"`                       // Required
+	Model         ModelConfig        `json:"model,omitempty"`
+	Dashboard     DashboardConfig    `json:"dashboard,omitempty"`           // Dashboard HTML / UX (optional)
 }
 
 // ExchangeConfig holds exchange-specific configuration
@@ -54,7 +55,7 @@ func LoadConfig(path string, ctx context.Context) (*Config, error) {
 	}
 	// Start config reloader goroutine if dynamic config is enabled
 	if cfg.DynamicConfig {
-		log.Println("Dynamic config is enabled (polls periodically; reloads when file modification time changes)")
+		log.Println("Dynamic config is enabled (reloads when file changes)")
 		go func() {
 			ticker := time.NewTicker(3 * time.Second)
 			defer ticker.Stop()
