@@ -38,8 +38,8 @@ const (
 	ORDERBOOK_VPOC_BUCKET_PCT    = 0.01 // VPOC bucket width as percent of mid price
 	ORDERBOOK_VPOC_DECAY_FACTOR  = 0.92 // 0 = Disabled. 1 = 100%
 	ORDERBOOK_VPOC_NORMAL_RATIO  = 1.3  // ≥ this: normal-ish wall vs mean(second, third bucket); ratio < this → low (flat book)
-	ORDERBOOK_VPOC_HIGH_RATIO    = 1.8  // Clearly stronger concentration than everyday structure
-	ORDERBOOK_VPOC_EXTREME_RATIO = 2.6  // Rare: only standout huge walls / order clusters (raise further if extreme still too common)
+	ORDERBOOK_VPOC_HIGH_RATIO    = 1.7  // Clearly stronger concentration than everyday structure
+	ORDERBOOK_VPOC_EXTREME_RATIO = 2.5  // Rare: only standout huge walls / order clusters (raise further if extreme still too common)
 
 	ORDERBOOK_NEAR_DEPTH_PCT   = 0.01 // How far from best bid/ask to analyze near-book volume, as a pct of price
 	ORDERBOOK_NEAR_EMA_ALPHA   = 0.01 // EMA alpha for near-bids / near-asks notional baselines in updateVolumes

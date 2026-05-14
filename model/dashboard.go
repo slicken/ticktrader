@@ -671,7 +671,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		function vpocBox(priceVal, ratioVal, regime, digits) {
 			const val = priceVal > 0 ? fmtPrice(priceVal, digits) : '—';
 			const r = Number(ratioVal);
-			const sub = (Number.isFinite(r) && r > 0) ? (fmt(r, 2) + 'x') : '—';
+			const sub = 'ratio ' + ((Number.isFinite(r) && r > 0) ? (fmt(r, 2) + 'x') : '—');
 			return '<div class="metric">' +
 				'<div class="metric-label metric-label-row"><span>OB VPOC</span>' + regimeLegendHtml() + '</div>' +
 				'<div class="metric-value ' + regimeClass(regime || 'normal') + '">' + val + '</div>' +

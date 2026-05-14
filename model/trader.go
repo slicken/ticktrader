@@ -2,7 +2,6 @@ package model
 
 import (
 	"math"
-	"sort"
 	"strings"
 	"ticktrader/exchange"
 	"time"
@@ -126,79 +125,6 @@ func nearVolumeRegime(strength float64) string {
 	}
 }
 
-func vpocRegime(vpoc float64, vsNextTwoRatio float64) string {
-	if vpoc <= 0 || vsNextTwoRatio <= 0 {
-		return "normal"
-	}
-	switch {
-	case vsNextTwoRatio >= ORDERBOOK_VPOC_EXTREME_RATIO:
-		return "extreme"
-	case vsNextTwoRatio >= ORDERBOOK_VPOC_HIGH_RATIO:
-		return "high"
-	case vsNextTwoRatio >= ORDERBOOK_VPOC_NORMAL_RATIO:
-		return "normal"
-	default:
-		return "low"
-	}
-}
-
-type vpocBucketEntry struct {
-	idx int64
-	vol float64
-}
-
-// vpocRatioFromBuckets is VPoc bucket notional / mean(notional of next two largest buckets, excluding vpocBucketIdx).
-// With only one other bucket, the mean is that bucket alone (not ÷2).
-// Same global bucket map as VPoc's bestIdx choice.
-func vpocRatioFromBuckets(vpocBucketIdx int64, buckets map[int64]float64) float64 {
-	if buckets == nil {
-		return 0
-	}
-	top := buckets[vpocBucketIdx]
-	if top <= 1e-9 {
-		return 0
-	}
-	var ents []vpocBucketEntry
-	for idx, vol := range buckets {
-		if vol <= 1e-9 {
-			continue
-		}
-		ents = append(ents, vpocBucketEntry{idx: idx, vol: vol})
-	}
-	if len(ents) <= 1 {
-		return 0
-	}
-	sort.Slice(ents, func(i, j int) bool {
-		if ents[i].vol != ents[j].vol {
-			return ents[i].vol > ents[j].vol
-		}
-		return ents[i].idx < ents[j].idx
-	})
-	var runners []float64
-	for _, e := range ents {
-		if e.idx == vpocBucketIdx {
-			continue
-		}
-		runners = append(runners, e.vol)
-		if len(runners) == 2 {
-			break
-		}
-	}
-	if len(runners) == 0 {
-		return 0
-	}
-	var baseline float64
-	if len(runners) == 1 {
-		baseline = runners[0]
-	} else {
-		baseline = (runners[0] + runners[1]) / 2
-	}
-	if baseline <= 1e-9 {
-		return 0
-	}
-	return top / baseline
-}
-
 func midPrice(pricePair [2]exchange.Price) float64 {
 	bid := pricePair[0].Price
 	ask := pricePair[1].Price
@@ -257,7 +183,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol
 		}
 	}
 
-	// decayed profile; zero or lower uses only the current orderbook snapshot.
+ 	// decayed profile; zero or lower uses only the current orderbook snapshot.
 	if t.vpocProfile.BucketSize <= 0 && tickSize > 0 {
 		t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
 	}
@@ -372,7 +298,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol
 		price = (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
 	}
 
-	vpRat = vpocRatioFromBuckets(bestIdx, vpocBuckets)
+	vpRat = vpocBucketRatio(vpocBuckets, bestIdx)
 	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, price, vpRat
 }
 
@@ -380,6 +306,57 @@ type VPOCProfile struct {
 	Buckets     map[int64]float64
 	BucketSize  float64
 	DecayFactor float64
+}
+
+// vpocBucketRatio is notion(vpocIdx) / mean(two largest other bucket notionals in buckets).
+// buckets is the same map used to pick vpocIdx (decayed profile or per-snapshot when decay off).
+func vpocBucketRatio(buckets map[int64]float64, vpocIdx int64) float64 {
+	if buckets == nil {
+		return 0
+	}
+	top := buckets[vpocIdx]
+	if top <= 1e-9 {
+		return 0
+	}
+	var first, second float64
+	for idx, vol := range buckets {
+		if idx == vpocIdx || vol <= 1e-9 {
+			continue
+		}
+		if vol > first {
+			second = first
+			first = vol
+		} else if vol > second {
+			second = vol
+		}
+	}
+	if first <= 1e-9 {
+		return 0
+	}
+	baseline := first
+	if second > 1e-9 {
+		baseline = (first + second) / 2
+	}
+	if baseline <= 1e-9 {
+		return 0
+	}
+	return top / baseline
+}
+
+func vpocRegime(vpoc float64, vsNextTwoRatio float64) string {
+	if vpoc <= 0 || vsNextTwoRatio <= 0 {
+		return "normal"
+	}
+	switch {
+	case vsNextTwoRatio >= ORDERBOOK_VPOC_EXTREME_RATIO:
+		return "extreme"
+	case vsNextTwoRatio >= ORDERBOOK_VPOC_HIGH_RATIO:
+		return "high"
+	case vsNextTwoRatio >= ORDERBOOK_VPOC_NORMAL_RATIO:
+		return "normal"
+	default:
+		return "low"
+	}
 }
 
 func (t *trader) updateTrade(trade *exchange.Trade) {
