@@ -404,15 +404,6 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				return 'neutral';
 			}
 		}
-		function smaDirectionChartStyle(slopeVal) {
-			if (slopeVal > 0) {
-				return { border: '#4ade80', background: 'rgba(74, 222, 128, 0.10)' };
-			}
-			if (slopeVal < 0) {
-				return { border: '#f87171', background: 'rgba(248, 113, 113, 0.10)' };
-			}
-			return { border: '#9ca3af', background: 'rgba(156, 163, 175, 0.12)' };
-		}
 		const DASHBOARD_CHART_WINDOW_SECONDS = {{ .ChartWindowSeconds }};
 		const DASHBOARD_REFRESH_MS = {{ .RefreshMs }};
 		const CHART_SCALE_RATIO = {{ .ChartScaleRatio }};
@@ -819,14 +810,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[2].label = 'mark';
 			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1sma20s);
 			chart.data.datasets[3].label = 'SMA20';
-			const sma20Style = smaDirectionChartStyle(row.m1_sma20_slope);
-			chart.data.datasets[3].borderColor = sma20Style.border;
-			chart.data.datasets[3].backgroundColor = sma20Style.background;
 			chart.data.datasets[4].data = alignSeriesToPrices(bids, m1sma200s);
 			chart.data.datasets[4].label = 'SMA200';
-			const sma200Style = smaDirectionChartStyle(row.m1_sma200_slope);
-			chart.data.datasets[4].borderColor = sma200Style.border;
-			chart.data.datasets[4].backgroundColor = sma200Style.background;
 			chart.data.datasets[5].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
 			chart.data.datasets[5].label = 'VPOC';
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
