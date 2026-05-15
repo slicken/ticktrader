@@ -80,8 +80,10 @@ type DashboardPairData struct {
 	FundingRate          float64               `json:"funding_rate"`
 	M1_SMA20             float64               `json:"m1_sma20"`
 	M1_SMA20Slope        float64               `json:"m1_sma20_slope"`
+	M1_SMA20SlopeRegime  string                `json:"m1_sma20_slope_regime"`
 	M1_SMA200            float64               `json:"m1_sma200"`
 	M1_SMA200Slope       float64               `json:"m1_sma200_slope"`
+	M1_SMA200SlopeRegime string                `json:"m1_sma200_slope_regime"`
 	BidPrices            []exchange.Price      `json:"bid_prices"`
 	AskPrices            []exchange.Price      `json:"ask_prices"`
 	MarkPrices           []exchange.Price      `json:"mark_prices"`
@@ -393,6 +395,24 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		const fmtPrice = (value, digits = 6) => fmt(value, digits);
 		const pct = (value, digits = 4) => fmt(value, digits) + '%';
 		const cls = value => value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
+		function smaSlopePctValueClass(regime) {
+			switch (regime) {
+			case 'up_strong':
+			case 'down_strong':
+				return regimeClass('high');
+			default:
+				return 'neutral';
+			}
+		}
+		function smaDirectionChartStyle(slopeVal) {
+			if (slopeVal > 0) {
+				return { border: '#4ade80', background: 'rgba(74, 222, 128, 0.10)' };
+			}
+			if (slopeVal < 0) {
+				return { border: '#f87171', background: 'rgba(248, 113, 113, 0.10)' };
+			}
+			return { border: '#9ca3af', background: 'rgba(156, 163, 175, 0.12)' };
+		}
 		const DASHBOARD_CHART_WINDOW_SECONDS = {{ .ChartWindowSeconds }};
 		const DASHBOARD_REFRESH_MS = {{ .RefreshMs }};
 		const CHART_SCALE_RATIO = {{ .ChartScaleRatio }};
@@ -689,11 +709,11 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
-		function smaBox(label, priceVal, slopeVal, digits) {
+		function smaBox(label, priceVal, slopeVal, slopeRegime, digits) {
 			return '<div class="metric">' +
 				'<div class="metric-label">' + label + '</div>' +
 				'<div class="metric-value ' + cls(slopeVal) + '">' + fmtPrice(priceVal, digits) + '</div>' +
-				'<div class="metric-value compact neutral near-volume-avg-line">slope ' + pct(slopeVal) + '</div>' +
+				'<div class="metric-value compact ' + smaSlopePctValueClass(slopeRegime) + ' near-volume-avg-line">slope ' + pct(slopeVal) + '</div>' +
 				'</div>';
 		}
 
@@ -726,8 +746,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
-				smaBox('SMA20', row.m1_sma20, row.m1_sma20_slope, digits) +
-				smaBox('SMA200', row.m1_sma200, row.m1_sma200_slope, digits) +
+				smaBox('SMA20', row.m1_sma20, row.m1_sma20_slope, row.m1_sma20_slope_regime, digits) +
+				smaBox('SMA200', row.m1_sma200, row.m1_sma200_slope, row.m1_sma200_slope_regime, digits) +
 			'</div>';
 		}
 
@@ -799,8 +819,14 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			chart.data.datasets[2].label = 'mark';
 			chart.data.datasets[3].data = alignSeriesToPrices(bids, m1sma20s);
 			chart.data.datasets[3].label = 'SMA20';
+			const sma20Style = smaDirectionChartStyle(row.m1_sma20_slope);
+			chart.data.datasets[3].borderColor = sma20Style.border;
+			chart.data.datasets[3].backgroundColor = sma20Style.background;
 			chart.data.datasets[4].data = alignSeriesToPrices(bids, m1sma200s);
 			chart.data.datasets[4].label = 'SMA200';
+			const sma200Style = smaDirectionChartStyle(row.m1_sma200_slope);
+			chart.data.datasets[4].borderColor = sma200Style.border;
+			chart.data.datasets[4].backgroundColor = sma200Style.background;
 			chart.data.datasets[5].data = bids.map(() => row.vpoc > 0 ? row.vpoc : null);
 			chart.data.datasets[5].label = 'VPOC';
 			const tradeAlign = alignTradesToPrices(bids, asks, trades);
@@ -1197,8 +1223,10 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			FundingRate:          t.fundingRate,
 			M1_SMA20:             t.m1_SMA20,
 			M1_SMA20Slope:        t.m1_SMA20Slope,
+			M1_SMA20SlopeRegime:  smaSlopeRegime(t.m1_SMA20Slope),
 			M1_SMA200:            t.m1_SMA200,
 			M1_SMA200Slope:       t.m1_SMA200Slope,
+			M1_SMA200SlopeRegime: smaSlopeRegime(t.m1_SMA200Slope),
 			BidPrices:            bidPrices,
 			AskPrices:            askPrices,
 			MarkPrices:           dashboardPricePoint(t.MarkPrice, sampleTime),

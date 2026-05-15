@@ -31,6 +31,9 @@ const (
 	SPREAD_HIGH_PCT    = 0.02  // Threshold for "high" spread regime, as a pct of price
 	SPREAD_EXTREME_PCT = 0.05  // Threshold for "extreme" spread regime, as a pct of price
 
+	SMA_SLOPE_FLAT_PCT   = 0.05 // Threshold for "flat" SMA slope regime, as |pct change vs prior 1m bar| (updateBar)
+	SMA_SLOPE_STRONG_PCT = 0.22 // Threshold for "strong" SMA slope regime, as |pct change vs prior 1m bar| (updateBar)
+
 	ORDERBOOK_LEVEL         = 200 // How many orderbook levels to pull/analyze when reading book data
 	ORDERBOOK_DEPTH_PCT     = 0.5 // Only analyse orders within this percent depth from mid on each side
 	ORDERBOOK_WEIGHT_FACTOR = 0.0 // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.

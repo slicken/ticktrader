@@ -112,6 +112,22 @@ func spreadRegime(spreadPct float64) string {
 	}
 }
 
+// smaSlopeRegime classifies 1m SMA slope (% change vs prior bar). Values: flat, up_normal, up_strong, down_normal, down_strong.
+func smaSlopeRegime(slopePct float64) string {
+	switch {
+	case math.Abs(slopePct) <= SMA_SLOPE_FLAT_PCT:
+		return "flat"
+	case slopePct > SMA_SLOPE_STRONG_PCT:
+		return "up_strong"
+	case slopePct > SMA_SLOPE_FLAT_PCT:
+		return "up_normal"
+	case slopePct < -SMA_SLOPE_STRONG_PCT:
+		return "down_strong"
+	default:
+		return "down_normal"
+	}
+}
+
 func nearVolumeRegime(strength float64) string {
 	switch {
 	case strength >= ORDERBOOK_NEAR_EXTREME_PCT:

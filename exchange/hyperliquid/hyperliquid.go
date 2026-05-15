@@ -977,7 +977,6 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 	bids := make([]exchange.Price, 0, len(bidsSlice))
 	asks := make([]exchange.Price, 0, len(asksSlice))
 
-	// Process bids using the old untyped logic
 	for _, bid := range bidsSlice {
 		bidMap, ok := bid.(map[string]interface{})
 		if !ok {
@@ -998,7 +997,6 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 		})
 	}
 
-	// Process asks using the old untyped logic
 	for _, ask := range asksSlice {
 		askMap, ok := ask.(map[string]interface{})
 		if !ok {

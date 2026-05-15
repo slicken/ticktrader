@@ -16,7 +16,6 @@ func NewOrderbook(pair string) *Orderbook {
 	}
 }
 
-// Sort sorts bids descending and asks ascending (best bid / best ask at index 0).
 func (o *Orderbook) Sort() {
 	sort.SliceStable(o.Bids, func(i, j int) bool {
 		return o.Bids[i].Price > o.Bids[j].Price
