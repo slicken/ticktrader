@@ -71,8 +71,8 @@ type trader struct {
 	Price             float64
 	bestBid           float64
 	bestAsk           float64
-	asksVol           float64
 	bidsVol           float64
+	asksVol           float64
 	volumePct         float64
 	nearBidsVolumeStr float64
 	nearBidsVolumeAvg float64 // EMA of near bid-side notional
@@ -197,8 +197,8 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		Price:             0,
 		bestBid:           0,
 		bestAsk:           0,
-		asksVol:           0,
 		bidsVol:           0,
+		asksVol:           0,
 		volumePct:         0,
 		nearBidsVolumeStr: 0,
 		nearBidsVolumeAvg: 0,

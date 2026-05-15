@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 	"ticktrader/config"
 	"ticktrader/exchange"
+	"time"
 
 	hl "go_hyperliquid"
 )
@@ -962,11 +962,11 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 	if !ok || len(levels) != 2 {
 		return
 	}
-	asksSlice, ok := levels[1].([]interface{})
+	bidsSlice, ok := levels[0].([]interface{})
 	if !ok {
 		return
 	}
-	bidsSlice, ok := levels[0].([]interface{})
+	asksSlice, ok := levels[1].([]interface{})
 	if !ok {
 		return
 	}
@@ -974,29 +974,8 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 	coin := orderbook["coin"].(string)
 
 	now := time.Now()
-	asks := make([]exchange.Price, 0, len(asksSlice))
 	bids := make([]exchange.Price, 0, len(bidsSlice))
-
-	// Process asks using the old untyped logic
-	for _, ask := range asksSlice {
-		askMap, ok := ask.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		priceStr, _ := askMap["px"].(string)
-		sizeStr, _ := askMap["sz"].(string)
-		price, _ := strconv.ParseFloat(priceStr, 64)
-		size, _ := strconv.ParseFloat(sizeStr, 64)
-		if price <= 0 || size <= 0 {
-			continue
-		}
-
-		asks = append(asks, exchange.Price{
-			Price: price,
-			Size:  size,
-			Time:  now,
-		})
-	}
+	asks := make([]exchange.Price, 0, len(asksSlice))
 
 	// Process bids using the old untyped logic
 	for _, bid := range bidsSlice {
@@ -1019,14 +998,35 @@ func (e *Hyperliquid) handleOrderbook(data interface{}) {
 		})
 	}
 
+	// Process asks using the old untyped logic
+	for _, ask := range asksSlice {
+		askMap, ok := ask.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		priceStr, _ := askMap["px"].(string)
+		sizeStr, _ := askMap["sz"].(string)
+		price, _ := strconv.ParseFloat(priceStr, 64)
+		size, _ := strconv.ParseFloat(sizeStr, 64)
+		if price <= 0 || size <= 0 {
+			continue
+		}
+
+		asks = append(asks, exchange.Price{
+			Price: price,
+			Size:  size,
+			Time:  now,
+		})
+	}
+
 	e.Lock()
 	ob, exists := e.Orderbook[coin]
 	if !exists {
 		ob = &exchange.Orderbook{Pair: coin}
 		e.Orderbook[coin] = ob
 	}
-	ob.Asks = asks
 	ob.Bids = bids
+	ob.Asks = asks
 	ob.Sort()
 	ob.LastUpdated = now
 	snapshot := ob.Clone()
@@ -1294,7 +1294,7 @@ func (e *Hyperliquid) PlaceOrders(orders []exchange.Order) error {
 
 		// For market orders, set limit price to cross the spread for immediate fill
 		if order.Type == "market" && bulkOrder.LimitPx == 0 {
-			if ob, ok := e.Orderbook[order.Pair]; ok && len(ob.Asks) > 0 && len(ob.Bids) > 0 {
+			if ob, ok := e.Orderbook[order.Pair]; ok && len(ob.Bids) > 0 && len(ob.Asks) > 0 {
 				switch order.Side {
 				case "buy":
 					bulkOrder.LimitPx = ob.Asks[0].Price * 1.1
@@ -1306,7 +1306,7 @@ func (e *Hyperliquid) PlaceOrders(orders []exchange.Order) error {
 
 		// For trigger orders with Price = 0, set limit price for immediate execution when triggered
 		if order.TriggerPrice > 0 && order.Price == 0 && order.TriggerType == "market" {
-			if ob, ok := e.Orderbook[order.Pair]; ok && len(ob.Asks) > 0 && len(ob.Bids) > 0 {
+			if ob, ok := e.Orderbook[order.Pair]; ok && len(ob.Bids) > 0 && len(ob.Asks) > 0 {
 				switch order.Side {
 				case "buy":
 					// For buy trigger, set limit price slightly above current ask for immediate execution

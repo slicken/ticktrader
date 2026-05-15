@@ -700,7 +700,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		function vpocBox(priceVal, ratioVal, regime, digits) {
 			const val = priceVal > 0 ? fmtPrice(priceVal, digits) : '—';
 			const r = Number(ratioVal);
-			const sub = 'ratio ' + ((Number.isFinite(r) && r > 0) ? (fmt(r, 2) + 'x') : '—');
+			const sub = 'str ' + ((Number.isFinite(r) && r > 0) ? (fmt(r, 2) + 'x') : '—');
 			return '<div class="metric">' +
 				'<div class="metric-label metric-label-row"><span>OB VPOC</span>' + regimeLegendHtml() + '</div>' +
 				'<div class="metric-value ' + regimeClass(regime || 'normal') + '">' + val + '</div>' +
@@ -719,8 +719,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				vpocBox(row.vpoc, row.vpoc_ratio, row.vpoc_regime, digits) +
 				metric('Trades / min', row.trades_per_minute) +
 				metric('Volume Imbalance', pct(row.volume_pct), cls(row.volume_pct)) +
-				nearVolumeBox('Near Asks Vol', row.near_asks_volume_str, row.near_asks_volume_avg, row.near_asks_volume_regime) +
 				nearVolumeBox('Near Bids Vol', row.near_bids_volume_str, row.near_bids_volume_avg, row.near_bids_volume_regime) +
+				nearVolumeBox('Near Asks Vol', row.near_asks_volume_str, row.near_asks_volume_avg, row.near_asks_volume_regime) +
 				spreadBox('Spread', row.spread, row.spread_avg, row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), 'neutral') +
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
@@ -992,22 +992,22 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			return aligned;
 		}
 
-		function alignTradesToPrices(prices, askPrices, trades) {
-			const aligned = new Array(prices.length).fill(null);
-			const sizes = new Array(prices.length).fill(null);
-			const starts = new Array(prices.length).fill(null);
-			const ends = new Array(prices.length).fill(null);
-			const sides = new Array(prices.length).fill(null);
+		function alignTradesToPrices(bidPrices, askPrices, trades) {
+			const aligned = new Array(bidPrices.length).fill(null);
+			const sizes = new Array(bidPrices.length).fill(null);
+			const starts = new Array(bidPrices.length).fill(null);
+			const ends = new Array(bidPrices.length).fill(null);
+			const sides = new Array(bidPrices.length).fill(null);
 			let priceIndex = 0;
 			for (const trade of trades) {
 				const tradeTime = new Date(trade.Time).getTime();
 				while (
-					priceIndex < prices.length - 1 &&
-					new Date(prices[priceIndex + 1].Time).getTime() <= tradeTime
+					priceIndex < bidPrices.length - 1 &&
+					new Date(bidPrices[priceIndex + 1].Time).getTime() <= tradeTime
 				) {
 					priceIndex++;
 				}
-				if (prices.length > 0) {
+				if (bidPrices.length > 0) {
 					const end = trade.EndPrice || trade.Price;
 					let start = trade.StartPrice || end;
 					const side = trade.Side || '';
@@ -1015,7 +1015,7 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 						if (side === 'buy') {
 							start = askPrices[priceIndex]?.Price || start;
 						} else if (side === 'sell') {
-							start = prices[priceIndex]?.Price || start;
+							start = bidPrices[priceIndex]?.Price || start;
 						}
 					}
 					aligned[priceIndex] = end;

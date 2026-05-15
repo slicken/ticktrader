@@ -16,15 +16,13 @@ func NewOrderbook(pair string) *Orderbook {
 	}
 }
 
-// Sort asks bids in ascending and descending order respectively
+// Sort sorts bids descending and asks ascending (best bid / best ask at index 0).
 func (o *Orderbook) Sort() {
-	// sort asks in ascending order
-	sort.SliceStable(o.Asks, func(i, j int) bool {
-		return o.Asks[i].Price < o.Asks[j].Price
-	})
-	// sort bids in descending order
 	sort.SliceStable(o.Bids, func(i, j int) bool {
 		return o.Bids[i].Price > o.Bids[j].Price
+	})
+	sort.SliceStable(o.Asks, func(i, j int) bool {
+		return o.Asks[i].Price < o.Asks[j].Price
 	})
 }
 
@@ -35,38 +33,6 @@ func (o *Orderbook) Clone() Orderbook {
 		Asks:        append([]Price(nil), o.Asks...),
 		LastUpdated: o.LastUpdated,
 	}
-}
-
-func (o *Orderbook) AddAsk(price Price) {
-	if price.Price <= 0 {
-		return
-	}
-	idx := sort.Search(len(o.Asks), func(i int) bool {
-		return o.Asks[i].Price >= price.Price
-	})
-
-	if price.Size == 0 {
-		if idx < len(o.Asks) && o.Asks[idx].Price == price.Price {
-			copy(o.Asks[idx:], o.Asks[idx+1:])
-			o.Asks = o.Asks[:len(o.Asks)-1]
-			o.LastUpdated = time.Now()
-		}
-		return
-	}
-
-	if idx < len(o.Asks) && o.Asks[idx].Price == price.Price {
-		o.Asks[idx] = price
-		o.LastUpdated = time.Now()
-		return
-	}
-
-	o.Asks = append(o.Asks, Price{}) // grow slice
-	copy(o.Asks[idx+1:], o.Asks[idx:])
-	o.Asks[idx] = price
-	if len(o.Asks) > max_depth {
-		o.Asks = o.Asks[:max_depth]
-	}
-	o.LastUpdated = time.Now()
 }
 
 func (o *Orderbook) AddBid(price Price) {
@@ -97,6 +63,38 @@ func (o *Orderbook) AddBid(price Price) {
 	o.Bids[idx] = price
 	if len(o.Bids) > max_depth {
 		o.Bids = o.Bids[:max_depth]
+	}
+	o.LastUpdated = time.Now()
+}
+
+func (o *Orderbook) AddAsk(price Price) {
+	if price.Price <= 0 {
+		return
+	}
+	idx := sort.Search(len(o.Asks), func(i int) bool {
+		return o.Asks[i].Price >= price.Price
+	})
+
+	if price.Size == 0 {
+		if idx < len(o.Asks) && o.Asks[idx].Price == price.Price {
+			copy(o.Asks[idx:], o.Asks[idx+1:])
+			o.Asks = o.Asks[:len(o.Asks)-1]
+			o.LastUpdated = time.Now()
+		}
+		return
+	}
+
+	if idx < len(o.Asks) && o.Asks[idx].Price == price.Price {
+		o.Asks[idx] = price
+		o.LastUpdated = time.Now()
+		return
+	}
+
+	o.Asks = append(o.Asks, Price{}) // grow slice
+	copy(o.Asks[idx+1:], o.Asks[idx:])
+	o.Asks[idx] = price
+	if len(o.Asks) > max_depth {
+		o.Asks = o.Asks[:max_depth]
 	}
 	o.LastUpdated = time.Now()
 }

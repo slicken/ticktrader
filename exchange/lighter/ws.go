@@ -219,14 +219,14 @@ func (e *Lighter) handleRawOrderbook(symbol string, data []byte) error {
 	var msg struct {
 		Type      string `json:"type"`
 		OrderBook struct {
-			Asks []struct {
-				Price string `json:"price"`
-				Size  string `json:"size"`
-			} `json:"asks"`
 			Bids []struct {
 				Price string `json:"price"`
 				Size  string `json:"size"`
 			} `json:"bids"`
+			Asks []struct {
+				Price string `json:"price"`
+				Size  string `json:"size"`
+			} `json:"asks"`
 		} `json:"order_book"`
 		Timestamp int64 `json:"timestamp"`
 	}
@@ -257,14 +257,14 @@ func (e *Lighter) handleRawTicker(symbol string, data []byte) error {
 	var msg struct {
 		Type   string `json:"type"`
 		Ticker struct {
-			Ask struct {
-				Price string `json:"price"`
-				Size  string `json:"size"`
-			} `json:"a"`
 			Bid struct {
 				Price string `json:"price"`
 				Size  string `json:"size"`
 			} `json:"b"`
+			Ask struct {
+				Price string `json:"price"`
+				Size  string `json:"size"`
+			} `json:"a"`
 		} `json:"ticker"`
 		Timestamp int64 `json:"timestamp"`
 	}

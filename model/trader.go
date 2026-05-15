@@ -142,7 +142,7 @@ func pricePairTime(pricePair [2]exchange.Price) time.Time {
 }
 
 func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
-	asksVol, bidsVol, volumePct, bidNearNotional, askNearNotional, vpoc, vpRat := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
+	bidsVol, asksVol, volumePct, bidNearNotional, askNearNotional, vpoc, vpRat := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
 
 	t.Lock()
 	defer t.Unlock()
@@ -159,14 +159,14 @@ func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
 		t.nearAsksVolumeStr = (askNearNotional / base) * 100
 	}
 
-	t.asksVol = asksVol
 	t.bidsVol = bidsVol
+	t.asksVol = asksVol
 	t.volumePct = volumePct
 	t.vpoc = vpoc
 	t.vpocRatio = vpRat
 }
 
-func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol, bidsVol, imb, bidNear, askNear, vpoc, vpRat float64) {
+func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol, asksVol, imb, bidNear, askNear, vpoc, vpRat float64) {
 	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
 		return
 	}
@@ -183,7 +183,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol
 		}
 	}
 
- 	// decayed profile; zero or lower uses only the current orderbook snapshot.
+	// decayed profile; zero or lower uses only the current orderbook snapshot.
 	if t.vpocProfile.BucketSize <= 0 && tickSize > 0 {
 		t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
 	}
@@ -273,7 +273,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol
 	}
 
 	if !vpocEnabled {
-		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
+		return actualBidNotional, actualAskNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
 	}
 
 	// VPOC is the highest-volume price level inside the single highest-volume bucket.
@@ -290,7 +290,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol
 	}
 
 	if maxBucketVolume <= 0 {
-		return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
+		return actualBidNotional, actualAskNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
 	}
 
 	price := vpocBucketPrice[bestIdx].Price
@@ -299,7 +299,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (asksVol
 	}
 
 	vpRat = vpocBucketRatio(vpocBuckets, bestIdx)
-	return actualAskNotional, actualBidNotional, imbalance, bidNearNotional, askNearNotional, price, vpRat
+	return actualBidNotional, actualAskNotional, imbalance, bidNearNotional, askNearNotional, price, vpRat
 }
 
 type VPOCProfile struct {
@@ -478,10 +478,10 @@ func (t *trader) calculateSlippage(trade *exchange.Trade) {
 	}
 
 	var ref float64
-	if side == "buy" {
-		ref = t.bestAsk
-	} else {
+	if side == "sell" {
 		ref = t.bestBid
+	} else if side == "buy" {
+		ref = t.bestAsk
 	}
 	if ref <= 0 {
 		return
