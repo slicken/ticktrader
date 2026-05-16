@@ -15,10 +15,11 @@ func (t *trader) updatePair(pair *exchange.Pair) {
 	t.Lock()
 	defer t.Unlock()
 
-	t.Price = pair.Price
+	t.MidPrice = pair.Price
 	t.MarkPrice = pair.MarkPrice
 	t.openInterest = pair.OpenInterest
 	t.fundingRate = pair.FundingRate
+	t.updateM1SMADistances()
 }
 
 func (t *trader) updatePrices(prices *[]exchange.Price) {
@@ -45,6 +46,7 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	t.volatilityPct = EMA(calculateVolatilityPct(t.Prices, VOLATILITY_WINDOW), t.volatilityPct, VOLATILITY_EMA_ALPHA)
 	t.latencyBufferPct = EMA(calculateLatencyBufferPct(t.parent.Exchange.GetLatency(), spreadPct), t.latencyBufferPct, LATENCY_EMA_ALPHA)
 	t.spreadAvg = EMA(spreadPct, t.spreadAvg, SPREAD_EMA_ALPHA)
+	t.updateM1SMADistances()
 }
 
 func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
@@ -383,28 +385,6 @@ func (t *trader) updateTrade(trade *exchange.Trade) {
 	t.Lock()
 	defer t.Unlock()
 
-	tradedPrice := 0.0
-	if trade.Order != nil && trade.Order.Price > 0 {
-		tradedPrice = trade.Order.Price
-	}
-	if len(trade.Fills) > 0 {
-		var weightedFillPrice float64
-		var totalSize float64
-		for _, fill := range trade.Fills {
-			if fill == nil || fill.Price <= 0 || fill.Size <= 0 {
-				continue
-			}
-			totalSize += fill.Size
-			weightedFillPrice += fill.Price * fill.Size
-		}
-		if totalSize > 0 {
-			tradedPrice = weightedFillPrice / totalSize
-		}
-	}
-	if tradedPrice > 0 {
-		t.lastTradePrice = tradedPrice
-	}
-
 	insertWithLimitInPlace(&t.Trades, *trade, ARRAY_SIZE)
 	t.tradePerMinute = t.calculateTradesInDuration(time.Minute)
 	t.calculateSlippage(trade)
@@ -568,6 +548,31 @@ func (t *trader) updateBar(bar *exchange.Bar) {
 		if previousSMA200 > 0 {
 			t.m1_SMA200Slope = ((sma - previousSMA200) / previousSMA200) * 100
 		}
+	}
+	t.updateM1SMADistances()
+}
+
+// updateM1SMADistances sets signed % distance of mid (bid/ask midpoint, else exchange pair mid) from each M1 SMA.
+// The caller must hold t.Lock.
+func (t *trader) updateM1SMADistances() {
+	mid := t.MidPrice
+	if t.bestBid > 0 && t.bestAsk > 0 {
+		mid = (t.bestBid + t.bestAsk) / 2
+	}
+	if mid <= 0 {
+		t.m1_SMA20Distance = 0
+		t.m1_SMA200Distance = 0
+		return
+	}
+	if t.m1_SMA20 > 0 {
+		t.m1_SMA20Distance = ((mid - t.m1_SMA20) / t.m1_SMA20) * 100
+	} else {
+		t.m1_SMA20Distance = 0
+	}
+	if t.m1_SMA200 > 0 {
+		t.m1_SMA200Distance = ((mid - t.m1_SMA200) / t.m1_SMA200) * 100
+	} else {
+		t.m1_SMA200Distance = 0
 	}
 }
 

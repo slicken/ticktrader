@@ -81,9 +81,11 @@ type DashboardPairData struct {
 	M1_SMA20             float64               `json:"m1_sma20"`
 	M1_SMA20Slope        float64               `json:"m1_sma20_slope"`
 	M1_SMA20SlopeRegime  string                `json:"m1_sma20_slope_regime"`
+	M1_SMA20Distance     float64               `json:"m1_sma20_distance"`
 	M1_SMA200            float64               `json:"m1_sma200"`
 	M1_SMA200Slope       float64               `json:"m1_sma200_slope"`
 	M1_SMA200SlopeRegime string                `json:"m1_sma200_slope_regime"`
+	M1_SMA200Distance    float64               `json:"m1_sma200_distance"`
 	BidPrices            []exchange.Price      `json:"bid_prices"`
 	AskPrices            []exchange.Price      `json:"ask_prices"`
 	MarkPrices           []exchange.Price      `json:"mark_prices"`
@@ -700,11 +702,16 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
-		function smaBox(label, priceVal, slopeVal, slopeRegime, digits) {
+		function smaBox(label, priceVal, slopeVal, slopeRegime, distanceVal, digits) {
+			const slopeLine = '<div class="metric-value compact ' + smaSlopePctValueClass(slopeRegime) + ' near-volume-avg-line">slope ' + pct(slopeVal) + '</div>';
+			const distanceLine = priceVal > 0
+				? '<div class="metric-value compact neutral near-volume-avg-line">dist ' + pct(distanceVal) + '</div>'
+				: '';
 			return '<div class="metric">' +
 				'<div class="metric-label">' + label + '</div>' +
 				'<div class="metric-value ' + cls(slopeVal) + '">' + fmtPrice(priceVal, digits) + '</div>' +
-				'<div class="metric-value compact ' + smaSlopePctValueClass(slopeRegime) + ' near-volume-avg-line">slope ' + pct(slopeVal) + '</div>' +
+				slopeLine +
+				distanceLine +
 				'</div>';
 		}
 
@@ -737,8 +744,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
-				smaBox('SMA20', row.m1_sma20, row.m1_sma20_slope, row.m1_sma20_slope_regime, digits) +
-				smaBox('SMA200', row.m1_sma200, row.m1_sma200_slope, row.m1_sma200_slope_regime, digits) +
+				smaBox('SMA20', row.m1_sma20, row.m1_sma20_slope, row.m1_sma20_slope_regime, row.m1_sma20_distance, digits) +
+				smaBox('SMA200', row.m1_sma200, row.m1_sma200_slope, row.m1_sma200_slope_regime, row.m1_sma200_distance, digits) +
 			'</div>';
 		}
 
@@ -1172,7 +1179,7 @@ func (d *Dashboard) getDashboardData() DashboardData {
 		priceDecimals := tickSizeDecimals(pairInfo.Base.TickSize)
 
 		t.RLock()
-		midPrice := t.Price
+		midPrice := t.MidPrice
 		spread := 0.0
 		if t.bestBid > 0 && t.bestAsk > 0 {
 			midPrice = (t.bestBid + t.bestAsk) / 2
@@ -1209,9 +1216,11 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			M1_SMA20:             t.m1_SMA20,
 			M1_SMA20Slope:        t.m1_SMA20Slope,
 			M1_SMA20SlopeRegime:  smaSlopeRegime(t.m1_SMA20Slope),
+			M1_SMA20Distance:     t.m1_SMA20Distance,
 			M1_SMA200:            t.m1_SMA200,
 			M1_SMA200Slope:       t.m1_SMA200Slope,
 			M1_SMA200SlopeRegime: smaSlopeRegime(t.m1_SMA200Slope),
+			M1_SMA200Distance:    t.m1_SMA200Distance,
 			BidPrices:            bidPrices,
 			AskPrices:            askPrices,
 			MarkPrices:           dashboardPricePoint(t.MarkPrice, sampleTime),

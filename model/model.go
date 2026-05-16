@@ -71,29 +71,30 @@ type trader struct {
 	slippageAvg       float64
 	spreadAvg         float64
 	MarkPrice         float64
-	Price             float64
+	MidPrice          float64
 	bestBid           float64
 	bestAsk           float64
 	bidsVol           float64
 	asksVol           float64
 	volumePct         float64
 	nearBidsVolumeStr float64
-	nearBidsVolumeAvg float64 // EMA of near bid-side notional
+	nearBidsVolumeAvg float64
 	nearAsksVolumeStr float64
-	nearAsksVolumeAvg float64 // EMA of near ask-side notional (strength uses avg of bid+ask EMA as baseline)
+	nearAsksVolumeAvg float64
 	vpoc              float64
-	vpocRatio         float64 // dominant bucket vs combined 2nd+3rd in depth band (dashboard / regime)
+	vpocRatio         float64
 	vpocProfile       VPOCProfile
 	volatilityPct     float64
 	latencyBufferPct  float64
 	tradePerMinute    int
-	lastTradePrice    float64
 	openInterest      float64
 	fundingRate       float64
 	m1_SMA20          float64
 	m1_SMA20Slope     float64
+	m1_SMA20Distance  float64
 	m1_SMA200         float64
 	m1_SMA200Slope    float64
+	m1_SMA200Distance float64
 	sync.RWMutex
 }
 
@@ -197,7 +198,7 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		slippageAvg:       0,
 		spreadAvg:         0,
 		MarkPrice:         0,
-		Price:             0,
+		MidPrice:          0,
 		bestBid:           0,
 		bestAsk:           0,
 		bidsVol:           0,
@@ -213,13 +214,14 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		volatilityPct:     0,
 		latencyBufferPct:  0,
 		tradePerMinute:    0,
-		lastTradePrice:    0,
 		openInterest:      0,
 		fundingRate:       0,
 		m1_SMA20:          0,
 		m1_SMA20Slope:     0,
+		m1_SMA20Distance:  0,
 		m1_SMA200:         0,
 		m1_SMA200Slope:    0,
+		m1_SMA200Distance: 0,
 	}
 }
 
